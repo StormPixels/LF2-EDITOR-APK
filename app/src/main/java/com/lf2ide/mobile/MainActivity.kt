@@ -2,6 +2,7 @@ package com.lf2ide.mobile
 
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
@@ -43,6 +44,13 @@ class MainActivity : AppCompatActivity() {
         if (uri != null) writeTo(uri, true)
     }
 
+    private val pickSprites = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        for (u in uris) sprites.addFromUri(u) { design.refresh() }
+    }
+
+    private lateinit var content: LinearLayout
+    private lateinit var sprites: SpriteStore
+    private lateinit var design: DesignPanel
     private lateinit var editor: EditText
     private lateinit var status: TextView
     private var ready = false
@@ -73,13 +81,17 @@ class MainActivity : AppCompatActivity() {
         bar.addView(button("Buka") { openLauncher.launch(arrayOf("*/*")) })
         bar.addView(button("Baru") { v -> newMenu(v) })
         bar.addView(button("Simpan") { save() })
+        bar.addView(button("Design") {
+            design.root.visibility = if (design.root.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            design.refresh()
+        })
         val barScroll = HorizontalScrollView(this).apply { addView(bar); isHorizontalScrollBarEnabled = false }
         root.addView(barScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         editor = object : EditText(this@MainActivity) {
             override fun onSelectionChanged(selStart: Int, selEnd: Int) {
                 super.onSelectionChanged(selStart, selEnd)
-                if (ready) updateStatus()
+                if (ready) { updateStatus(); design.follow() }
             }
         }.apply {
             setBackgroundColor(BG)
@@ -99,13 +111,21 @@ class MainActivity : AppCompatActivity() {
                 override fun afterTextChanged(s: Editable?) {
                     if (loading) return
                     dirty = true
+                    if (ready) design.follow()
                     scheduleHl(true)
                     handler.removeCallbacks(infoRun)
                     handler.postDelayed(infoRun, 900)
                 }
             })
         }
-        root.addView(editor, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        sprites = SpriteStore(this)
+        design = DesignPanel(this, sprites, editor) { pickSprites.launch(arrayOf("image/*")) }
+        design.root.visibility = View.GONE
+        content = LinearLayout(this)
+        content.addView(editor)
+        content.addView(design.root)
+        applyOrientation()
+        root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         status = TextView(this).apply {
             setBackgroundColor(PANEL); setTextColor(DIM); setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -115,6 +135,19 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
         ready = true
         updateStatus()
+    }
+
+    private fun applyOrientation() {
+        val land = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        content.orientation = if (land) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        val lp = { if (land) LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f) else LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f) }
+        editor.layoutParams = lp()
+        design.root.layoutParams = lp()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        applyOrientation()
     }
 
     // ---------- UI helper ----------
