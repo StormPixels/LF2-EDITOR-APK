@@ -16,6 +16,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.EditText
@@ -68,6 +69,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var content: LinearLayout
+    private lateinit var stage: FrameLayout
+    private lateinit var win: DesignWindow
+    private var placed = false
+    private var savedX = 0f
+    private var savedY = 0f
     private var rootDoc: DocumentFile? = null
     private val dirCache = HashMap<String, List<DocumentFile>>()
     private var nameIndex: HashMap<String, DocumentFile>? = null
@@ -146,16 +152,28 @@ class MainActivity : AppCompatActivity() {
         }
         sprites = SpriteStore(this)
         design = DesignPanel(this, sprites, editor) { pickSprites.launch(arrayOf("image/*")) }
+        win = DesignWindow(this, design.root)
+        win.onChanged = { layoutWindow() }
+        win.onSettled = { saveWindowPrefs() }
+        win.onToggleFloat = { setFloating(!win.floating) }
+        val pr = getSharedPreferences("lf2", MODE_PRIVATE)
+        win.fw = pr.getInt("win_w", 0)
+        win.fh = pr.getInt("win_h", 0)
+        if (pr.contains("win_x")) { savedX = pr.getFloat("win_x", 0f); savedY = pr.getFloat("win_y", 0f); placed = true }
+        if (pr.getBoolean("win_collapsed", false)) win.setCollapsed(true)
         sprites.finder = { path -> findSprite(path) }
         getSharedPreferences("lf2", MODE_PRIVATE).getString("root", null)?.let { s ->
             val u = Uri.parse(s)
             if (contentResolver.persistedUriPermissions.any { it.uri == u }) setRoot(u, false)
         }
         content = LinearLayout(this)
-        content.addView(design.root)
+        content.addView(win)
         content.addView(editor)
+        stage = FrameLayout(this)
+        stage.addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         applyOrientation()
-        root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(stage, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        if (pr.getBoolean("win_float", false)) stage.post { setFloating(true, false) }
 
         val keys = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setBackgroundColor(PANEL); setPadding(dp(4), dp(2), dp(4), dp(2)) }
         keys.addView(keyBtn("↶") { editor.onTextContextMenuItem(android.R.id.undo) })
@@ -223,17 +241,77 @@ class MainActivity : AppCompatActivity() {
         return m[n.lowercase()]
     }
 
+    // ---------- jendela Design: menempel / mengambang ----------
+    private fun setFloating(on: Boolean, save: Boolean = true) {
+        (win.parent as? ViewGroup)?.removeView(win)
+        win.setFloating(on)
+        if (on) {
+            if (win.fw <= 0) win.fw = minOf((stage.width * 0.85f).toInt(), dp(340))
+            if (win.fh <= 0) win.fh = minOf((stage.height * 0.6f).toInt(), dp(380))
+            stage.addView(win, FrameLayout.LayoutParams(win.fw, if (win.collapsed) dp(36) else win.fh))
+            if (placed) {
+                win.translationX = savedX; win.translationY = savedY
+            } else {
+                win.translationX = (stage.width - win.fw - dp(8)).toFloat(); win.translationY = dp(8).toFloat(); placed = true
+            }
+            win.clamp()
+        } else {
+            savedX = win.translationX; savedY = win.translationY
+            win.translationX = 0f; win.translationY = 0f
+            content.addView(win, 0)
+            applyOrientation()
+        }
+        if (save) saveWindowPrefs()
+        win.post { design.refresh() }
+    }
+
+    private fun layoutWindow() {
+        if (win.floating) {
+            val lp = win.layoutParams
+            if (lp != null) {
+                lp.width = win.fw
+                lp.height = if (win.collapsed) dp(36) else win.fh
+                win.layoutParams = lp
+            }
+        } else {
+            applyOrientation()
+        }
+        saveWindowPrefs()
+        win.post { design.refresh() }
+    }
+
+    private fun saveWindowPrefs() {
+        val x = if (win.floating) win.translationX else savedX
+        val y = if (win.floating) win.translationY else savedY
+        getSharedPreferences("lf2", MODE_PRIVATE).edit()
+            .putBoolean("win_float", win.floating).putBoolean("win_collapsed", win.collapsed)
+            .putInt("win_w", win.fw).putInt("win_h", win.fh)
+            .putFloat("win_x", x).putFloat("win_y", y).apply()
+    }
+
+    private fun resetWindow() {
+        getSharedPreferences("lf2", MODE_PRIVATE).edit().remove("win_x").remove("win_y").remove("win_w").remove("win_h").apply()
+        win.fw = 0; win.fh = 0; placed = false
+        if (win.floating) setFloating(true, false) else toast("Ukuran dan posisi akan di-reset saat Design dijadikan mengambang")
+    }
+
     private fun applyOrientation() {
         val land = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         content.orientation = if (land) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
         val lp = { if (land) LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f) else LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f) }
         editor.layoutParams = lp()
-        design.root.layoutParams = lp()
+        if (!win.floating) {
+            win.layoutParams = if (win.collapsed) {
+                if (land) LinearLayout.LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT)
+                else LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            } else lp()
+        }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         applyOrientation()
+        stage.post { win.clamp() }
     }
 
     // ---------- UI helper ----------
@@ -292,13 +370,18 @@ class MainActivity : AppCompatActivity() {
         val pm = PopupMenu(this, anchor)
         pm.menu.add("Sprite…")
         pm.menu.add("Simpan sebagai…")
+        val floatLabel = if (win.floating) "Design: tempel ke layar" else "Design: jadikan mengambang"
+        pm.menu.add(floatLabel)
+        pm.menu.add("Reset ukuran & posisi Design")
         pm.menu.add("Tampilkan/sembunyikan Design")
         pm.setOnMenuItemClickListener { item ->
             when (item.title.toString()) {
                 "Sprite…" -> pickSprites.launch(arrayOf("image/*"))
                 "Simpan sebagai…" -> saveAsLauncher.launch(docName)
+                floatLabel -> setFloating(!win.floating)
+                "Reset ukuran & posisi Design" -> resetWindow()
                 else -> {
-                    design.root.visibility = if (design.root.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                    win.visibility = if (win.visibility == View.VISIBLE) View.GONE else View.VISIBLE
                     design.refresh()
                 }
             }

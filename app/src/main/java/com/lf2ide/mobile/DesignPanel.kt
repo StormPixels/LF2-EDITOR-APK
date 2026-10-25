@@ -226,12 +226,12 @@ class DesignPanel(
     var folderSet = false
 
     fun follow() {
-        if (applying || root.visibility != View.VISIBLE) return
+        if (applying || !root.isShown) return
         handler.removeCallbacks(run)
         handler.postDelayed(run, 120)
     }
 
-    fun refresh() { if (root.visibility == View.VISIBLE) load() }
+    fun refresh() { if (root.isShown) load() }
 
     private fun load() {
         val t = ed.text.toString()
