@@ -44,11 +44,31 @@ class MainActivity : AppCompatActivity() {
         if (uri != null) writeTo(uri, true)
     }
 
+    /** Pilih folder game dengan izin permanen, supaya sprite bisa dicari otomatis dari jalur di .dat. */
+    private class OpenTree : ActivityResultContracts.OpenDocumentTree() {
+        override fun createIntent(context: Context, input: Uri?): Intent =
+            super.createIntent(context, input).addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
+    }
+
+    private val treeLauncher = registerForActivityResult(OpenTree()) { uri ->
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            } catch (e: Exception) { }
+            setRoot(uri, true)
+        }
+    }
+
     private val pickSprites = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         for (u in uris) sprites.addFromUri(u) { design.refresh() }
     }
 
     private lateinit var content: LinearLayout
+    private var rootDoc: DocumentFile? = null
+    private val dirCache = HashMap<String, List<DocumentFile>>()
+    private var nameIndex: HashMap<String, DocumentFile>? = null
     private lateinit var sprites: SpriteStore
     private lateinit var design: DesignPanel
     private lateinit var editor: EditText
@@ -78,6 +98,7 @@ class MainActivity : AppCompatActivity() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(BG) }
 
         val bar = LinearLayout(this).apply { setBackgroundColor(PANEL); setPadding(dp(6), dp(6), dp(6), dp(6)) }
+        bar.addView(button("Folder") { treeLauncher.launch(null) })
         bar.addView(button("Buka") { openLauncher.launch(arrayOf("*/*")) })
         bar.addView(button("Baru") { v -> newMenu(v) })
         bar.addView(button("Simpan") { save() })
@@ -121,6 +142,11 @@ class MainActivity : AppCompatActivity() {
         sprites = SpriteStore(this)
         design = DesignPanel(this, sprites, editor) { pickSprites.launch(arrayOf("image/*")) }
         design.root.visibility = View.GONE
+        sprites.finder = { path -> findSprite(path) }
+        getSharedPreferences("lf2", MODE_PRIVATE).getString("root", null)?.let { s ->
+            val u = Uri.parse(s)
+            if (contentResolver.persistedUriPermissions.any { it.uri == u }) setRoot(u, false)
+        }
         content = LinearLayout(this)
         content.addView(editor)
         content.addView(design.root)
@@ -135,6 +161,55 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
         ready = true
         updateStatus()
+    }
+
+    // ---------- folder game & pencarian sprite ----------
+    private fun setRoot(uri: Uri, fresh: Boolean) {
+        rootDoc = DocumentFile.fromTreeUri(this, uri)
+        synchronized(dirCache) { dirCache.clear() }
+        nameIndex = null
+        if (fresh) {
+            getSharedPreferences("lf2", MODE_PRIVATE).edit().putString("root", uri.toString()).apply()
+            sprites.reset()
+            toast("Folder game: ${rootDoc?.name}")
+        }
+        design.folderSet = rootDoc != null
+        design.refresh()
+    }
+
+    private fun kids(d: DocumentFile): List<DocumentFile> = synchronized(dirCache) {
+        dirCache.getOrPut(d.uri.toString()) { d.listFiles().toList() }
+    }
+
+    /** Cari file di folder game mengikuti jalur dari .dat (tanpa membedakan huruf besar/kecil); cadangan: cari nama file saja. */
+    private fun findSprite(path: String): ByteArray? {
+        val root = rootDoc ?: return null
+        val segs = path.trim().replace('\\', '/').split('/').filter { it.isNotEmpty() && it != "." }
+        if (segs.isEmpty()) return null
+        var cur: DocumentFile? = root
+        for (s in segs) {
+            val d = cur ?: break
+            cur = kids(d).firstOrNull { it.name.equals(s, ignoreCase = true) }
+        }
+        var file: DocumentFile? = if (cur != null && cur.isFile) cur else null
+        if (file == null) file = byName(segs.last())
+        val f = file ?: return null
+        return contentResolver.openInputStream(f.uri)?.use { it.readBytes() }
+    }
+
+    @Synchronized
+    private fun byName(n: String): DocumentFile? {
+        nameIndex?.let { return it[n.lowercase()] }
+        val r = rootDoc ?: return null
+        val m = HashMap<String, DocumentFile>()
+        fun walk(d: DocumentFile, depth: Int) {
+            for (c in kids(d)) {
+                if (c.isDirectory) { if (depth < 5) walk(c, depth + 1) } else c.name?.let { m[it.lowercase()] = c }
+            }
+        }
+        walk(r, 0)
+        nameIndex = m
+        return m[n.lowercase()]
     }
 
     private fun applyOrientation() {

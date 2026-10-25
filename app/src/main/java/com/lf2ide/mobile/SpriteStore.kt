@@ -9,7 +9,11 @@ import android.os.Looper
 import androidx.documentfile.provider.DocumentFile
 import java.io.File
 
-/** Sheet sprite: dimuat di thread latar, hitam = transparan (seperti IDE asli), disalin ke penyimpanan aplikasi. */
+/**
+ * Sheet sprite, diminta dengan jalur persis seperti tertulis di bmp_begin (mis. sprite\sys\bandit_0.bmp).
+ * Dimuat di thread latar; hitam = transparan (seperti IDE asli) kecuali gambar sudah punya alpha (PNG).
+ * Hasil disalin ke penyimpanan aplikasi sebagai cache.
+ */
 class SpriteStore(private val ctx: Context) {
     private val mem = HashMap<String, Bitmap>()
     private val busy = HashSet<String>()
@@ -17,36 +21,50 @@ class SpriteStore(private val ctx: Context) {
     private val dir = File(ctx.filesDir, "sprites").apply { mkdirs() }
     private val main = Handler(Looper.getMainLooper())
 
-    /** Pencari tambahan (mis. dari folder yang dibuka); dipanggil di thread latar. */
+    /** Pencari dari folder game; menerima jalur asli dari .dat; dipanggil di thread latar. */
     @Volatile
     var finder: ((String) -> ByteArray?)? = null
 
-    fun has(name: String) = mem.containsKey(name)
-    fun peek(name: String): Bitmap? = mem[name]
-    fun resetMissing() { missing.clear() }
+    private fun norm(p: String) = p.trim().replace('\\', '/').lowercase()
+    private fun base(k: String) = k.substringAfterLast('/')
+    private fun disk(k: String) = k.replace('/', '_')
 
-    fun request(name: String, onReady: () -> Unit) {
-        if (mem.containsKey(name) || missing.contains(name) || !busy.add(name)) return
+    fun has(path: String): Boolean { val k = norm(path); return mem.containsKey(k) || mem.containsKey(base(k)) }
+    fun peek(path: String): Bitmap? { val k = norm(path); return mem[k] ?: mem[base(k)] }
+    fun isMissing(path: String) = missing.contains(norm(path))
+
+    fun reset() {
+        mem.clear(); missing.clear()
+        dir.listFiles()?.forEach { it.delete() }
+    }
+
+    /** onDone dipanggil setelah selesai, berhasil atau tidak (cek has()/isMissing()). */
+    fun request(path: String, onDone: () -> Unit) {
+        val key = norm(path)
+        if (has(path) || missing.contains(key) || !busy.add(key)) return
         Thread {
             var bmp: Bitmap? = null
             try {
-                val f = File(dir, name)
+                var f = File(dir, disk(key))
+                if (!f.exists()) f = File(dir, base(key))      // sprite yang dipilih manual
                 var bytes: ByteArray? = if (f.exists()) f.readBytes() else null
                 if (bytes == null) {
-                    bytes = finder?.invoke(name)
-                    if (bytes != null) f.writeBytes(bytes)
+                    bytes = finder?.invoke(path)
+                    if (bytes != null) File(dir, disk(key)).writeBytes(bytes)
                 }
                 if (bytes != null) bmp = decode(bytes)
             } catch (e: Exception) { }
             val out = bmp
             main.post {
-                busy.remove(name)
-                if (out != null) { mem[name] = out; onReady() } else missing.add(name)
+                busy.remove(key)
+                if (out != null) mem[key] = out else missing.add(key)
+                onDone()
             }
         }.start()
     }
 
-    fun addFromUri(uri: Uri, onReady: () -> Unit) {
+    /** Sprite dipilih manual: disimpan dengan nama file saja. */
+    fun addFromUri(uri: Uri, onDone: () -> Unit) {
         Thread {
             var out: Bitmap? = null
             var nm = ""
@@ -60,7 +78,10 @@ class SpriteStore(private val ctx: Context) {
             } catch (e: Exception) { }
             val bmp = out
             val name = nm
-            main.post { if (bmp != null) { mem[name] = bmp; missing.remove(name); onReady() } }
+            main.post {
+                if (bmp != null) { mem[name] = bmp; missing.clear() }
+                onDone()
+            }
         }.start()
     }
 
@@ -69,7 +90,9 @@ class SpriteStore(private val ctx: Context) {
         val bmp = src.copy(Bitmap.Config.ARGB_8888, true) ?: return null
         val px = IntArray(bmp.width * bmp.height)
         bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
-        for (i in px.indices) if ((px[i] and 0xFFFFFF) == 0) px[i] = 0
+        var hasAlpha = false
+        for (p in px) if ((p ushr 24) < 255) { hasAlpha = true; break }
+        if (!hasAlpha) for (i in px.indices) if ((px[i] and 0xFFFFFF) == 0) px[i] = 0
         bmp.setPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
         return bmp
     }

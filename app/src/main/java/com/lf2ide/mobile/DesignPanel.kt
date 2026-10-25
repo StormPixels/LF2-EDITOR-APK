@@ -223,6 +223,7 @@ class DesignPanel(
     private var headKey = ""
     private var cell: Cell? = null
     private var applying = false
+    var folderSet = false
 
     fun follow() {
         if (applying || root.visibility != View.VISIBLE) return
@@ -251,12 +252,12 @@ class DesignPanel(
         val pic = fr?.top?.get("pic")
         val c = if (pic != null) Sprites.cellFor(sheets, pic) else null
         cell = c
-        if (c != null && !sprites.has(c.s.name)) {
-            sprites.request(c.s.name) { canvas.bmp = sprites.peek(c.s.name); canvas.invalidate(); note() }
+        if (c != null && !sprites.has(c.s.file)) {
+            sprites.request(c.s.file) { canvas.bmp = sprites.peek(c.s.file); canvas.invalidate(); note() }
         }
         canvas.frame = fr
         canvas.cell = c
-        canvas.bmp = if (c != null) sprites.peek(c.s.name) else null
+        canvas.bmp = if (c != null) sprites.peek(c.s.file) else null
         if (fr?.obj(canvas.sel) == null) canvas.sel = null
         idx.setText(fr?.index?.toString() ?: "")
         cap.setText(fr?.caption ?: "")
@@ -272,8 +273,9 @@ class DesignPanel(
         msg.text = when {
             f == null -> "Letakkan kursor di dalam sebuah frame"
             c == null -> "pic ${f.top["pic"]}: tidak ada di bmp_begin"
-            sprites.has(c.s.name) -> "pic ${f.top["pic"]} · ${c.s.name}"
-            else -> "Sprite \"${c.s.name}\" belum dimuat. Ketuk Sprite…"
+            sprites.has(c.s.file) -> "pic ${f.top["pic"]} · ${c.s.file}"
+            sprites.isMissing(c.s.file) -> if (folderSet) "Tidak ditemukan di folder game: ${c.s.file}" else "Butuh ${c.s.file}. Pilih folder game (tombol Folder) atau ketuk Sprite…"
+            else -> "Memuat ${c.s.file}…"
         }
     }
 
