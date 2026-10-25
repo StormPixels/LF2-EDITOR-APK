@@ -38,8 +38,8 @@ class Highlighter(lang: String) {
     }
 
     companion object {
-        const val C_COMMENT = 0xFF6A9955.toInt()
-        const val C_NUMBER = 0xFFD7BA7D.toInt()
-        val LIST_COLORS = intArrayOf(0xFF5AA7FF.toInt(), 0xFFC586C0.toInt(), 0xFF4EC9B0.toInt(), 0xFFE0A060.toInt())
+        const val C_COMMENT = 0xFF64748B.toInt()
+        const val C_NUMBER = 0xFFFBBF24.toInt()
+        val LIST_COLORS = intArrayOf(0xFF38BDF8.toInt(), 0xFFE879F9.toInt(), 0xFF2DD4BF.toInt(), 0xFFF59E0B.toInt())
     }
 }

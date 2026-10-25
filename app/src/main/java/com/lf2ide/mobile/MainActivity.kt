@@ -16,6 +16,8 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -73,6 +75,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var design: DesignPanel
     private lateinit var editor: EditText
     private lateinit var status: TextView
+    private lateinit var titleName: TextView
+    private lateinit var titleStatus: TextView
     private var ready = false
     private var loading = false
     private var docUri: Uri? = null
@@ -88,33 +92,35 @@ class MainActivity : AppCompatActivity() {
     private val hlRun = Runnable { highlightVisible(needForce); needForce = false }
     private val infoRun = Runnable { computeInfo() }
 
-    private val BG = 0xFF1E2327.toInt()
-    private val PANEL = 0xFF262C31.toInt()
-    private val FG = 0xFFD6DDE3.toInt()
-    private val DIM = 0xFF8A96A0.toInt()
+    private val BG = 0xFF0B1220.toInt()
+    private val PANEL = 0xFF111B2E.toInt()
+    private val FG = 0xFFE2E8F0.toInt()
+    private val DIM = 0xFF94A3B8.toInt()
+    private val ACC = 0xFF22D3EE.toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(BG) }
 
-        val bar = LinearLayout(this).apply { setBackgroundColor(PANEL); setPadding(dp(6), dp(6), dp(6), dp(6)) }
-        bar.addView(button("Folder") { treeLauncher.launch(null) })
-        bar.addView(button("Buka") { openLauncher.launch(arrayOf("*/*")) })
-        bar.addView(button("Baru") { v -> newMenu(v) })
-        bar.addView(button("Simpan") { save() })
-        bar.addView(button("Design") {
-            design.root.visibility = if (design.root.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-            design.refresh()
-        })
-        val barScroll = HorizontalScrollView(this).apply { addView(bar); isHorizontalScrollBarEnabled = false }
-        root.addView(barScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        titleName = TextView(this).apply { setTextColor(FG); textSize = 16f; setTypeface(typeface, Typeface.BOLD); maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END }
+        titleStatus = TextView(this).apply { textSize = 12f; setPadding(dp(8), 0, dp(8), 0); maxLines = 1 }
+        val titleBox = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(titleName, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(titleStatus)
+        }
+        val appBar = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL; setBackgroundColor(PANEL); setPadding(dp(4), dp(4), dp(4), dp(4))
+            addView(iconBtn(R.drawable.ic_menu) { v -> mainMenu(v) })
+            addView(titleBox, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(iconBtn(R.drawable.ic_folder) { treeLauncher.launch(null) })
+            addView(iconBtn(R.drawable.ic_save) { save() })
+            addView(iconBtn(R.drawable.ic_more) { v -> moreMenu(v) })
+        }
+        root.addView(appBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        editor = object : EditText(this@MainActivity) {
-            override fun onSelectionChanged(selStart: Int, selEnd: Int) {
-                super.onSelectionChanged(selStart, selEnd)
-                if (ready) { updateStatus(); design.follow() }
-            }
-        }.apply {
+        editor = CodeEditText(this@MainActivity).apply {
+            onSel = { if (ready) { updateStatus(); design.follow() } }
             setBackgroundColor(BG)
             setTextColor(FG)
             typeface = Typeface.MONOSPACE
@@ -124,7 +130,6 @@ class MainActivity : AppCompatActivity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                 InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
             isVerticalScrollBarEnabled = true
-            setPadding(dp(8), dp(6), dp(8), dp(6))
             setOnScrollChangeListener { _, _, _, _, _ -> scheduleHl(false) }
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
@@ -141,17 +146,23 @@ class MainActivity : AppCompatActivity() {
         }
         sprites = SpriteStore(this)
         design = DesignPanel(this, sprites, editor) { pickSprites.launch(arrayOf("image/*")) }
-        design.root.visibility = View.GONE
         sprites.finder = { path -> findSprite(path) }
         getSharedPreferences("lf2", MODE_PRIVATE).getString("root", null)?.let { s ->
             val u = Uri.parse(s)
             if (contentResolver.persistedUriPermissions.any { it.uri == u }) setRoot(u, false)
         }
         content = LinearLayout(this)
-        content.addView(editor)
         content.addView(design.root)
+        content.addView(editor)
         applyOrientation()
         root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        val keys = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setBackgroundColor(PANEL); setPadding(dp(4), dp(2), dp(4), dp(2)) }
+        keys.addView(keyBtn("↶") { editor.onTextContextMenuItem(android.R.id.undo) })
+        keys.addView(keyBtn("↷") { editor.onTextContextMenuItem(android.R.id.redo) })
+        for ((lab, ins) in listOf("Tab" to "   ", "<" to "<", ">" to ">", ":" to ":", "_" to "_", "-" to "-", "#" to "#")) keys.addView(keyBtn(lab) { insertText(ins) })
+        root.addView(HorizontalScrollView(this).apply { addView(keys); isHorizontalScrollBarEnabled = false },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         status = TextView(this).apply {
             setBackgroundColor(PANEL); setTextColor(DIM); setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -235,6 +246,71 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+    private fun iconBtn(res: Int, onClick: (View) -> Unit) = ImageButton(this).apply {
+        setImageResource(res)
+        setBackgroundColor(0)
+        scaleType = ImageView.ScaleType.CENTER
+        layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
+        setOnClickListener { onClick(it) }
+    }
+
+    private fun keyBtn(label: String, onClick: () -> Unit) = Button(this).apply {
+        text = label
+        isAllCaps = false
+        textSize = 14f
+        setTextColor(FG)
+        setBackgroundColor(BG)
+        minWidth = 0
+        minimumWidth = dp(44)
+        minHeight = 0
+        minimumHeight = dp(36)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(38)).apply { setMargins(dp(2), 0, dp(2), 0) }
+        setOnClickListener { onClick() }
+    }
+
+    private fun insertText(t: String) {
+        val a = minOf(editor.selectionStart, editor.selectionEnd).coerceAtLeast(0)
+        val b = maxOf(editor.selectionStart, editor.selectionEnd).coerceAtLeast(0)
+        editor.text.replace(a, b, t)
+        editor.setSelection(a + t.length)
+    }
+
+    private fun mainMenu(anchor: View) {
+        val pm = PopupMenu(this, anchor)
+        pm.menu.add("Buka file")
+        for (n in listOf("Char", "Weapon", "Stage", "Attack", "BG")) pm.menu.add("Baru: $n")
+        pm.setOnMenuItemClickListener { item ->
+            val t = item.title.toString()
+            if (t == "Buka file") openLauncher.launch(arrayOf("*/*")) else loadTemplate(t.removePrefix("Baru: "))
+            true
+        }
+        pm.show()
+    }
+
+    private fun moreMenu(anchor: View) {
+        val pm = PopupMenu(this, anchor)
+        pm.menu.add("Sprite…")
+        pm.menu.add("Simpan sebagai…")
+        pm.menu.add("Tampilkan/sembunyikan Design")
+        pm.setOnMenuItemClickListener { item ->
+            when (item.title.toString()) {
+                "Sprite…" -> pickSprites.launch(arrayOf("image/*"))
+                "Simpan sebagai…" -> saveAsLauncher.launch(docName)
+                else -> {
+                    design.root.visibility = if (design.root.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                    design.refresh()
+                }
+            }
+            true
+        }
+        pm.show()
+    }
+
+    private fun loadTemplate(n: String) {
+        val text = assets.open("templates/$n.dat").use { String(it.readBytes(), Charsets.ISO_8859_1) }
+        load(text, "Baru_$n.dat", null, false)
+    }
 
     private fun newMenu(anchor: View) {
         val pm = PopupMenu(this, anchor)
@@ -359,7 +435,10 @@ class MainActivity : AppCompatActivity() {
             ln = l + 1
             col = s - lay.getLineStart(l) + 1
         }
-        status.text = "$docName${if (dirty) " ●" else ""}   Ln $ln, Col $col   $info"
+        titleName.text = docName
+        titleStatus.text = if (dirty) "● Belum disimpan" else "● Tersimpan"
+        titleStatus.setTextColor(if (dirty) 0xFFF59E0B.toInt() else ACC)
+        status.text = "Ln $ln, Col $col   $info"
     }
 
     companion object {

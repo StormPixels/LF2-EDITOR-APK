@@ -35,11 +35,11 @@ import kotlin.math.roundToInt
 
 class Sel(val type: String, val i: Int)
 
-private const val C_PANEL = 0xFF262C31.toInt()
-private const val C_BG = 0xFF1E2327.toInt()
-private const val C_FG = 0xFFD6DDE3.toInt()
-private const val C_DIM = 0xFF8A96A0.toInt()
-private const val C_ACC = 0xFF4AA3FF.toInt()
+private const val C_PANEL = 0xFF111B2E.toInt()
+private const val C_BG = 0xFF0B1220.toInt()
+private const val C_FG = 0xFFE2E8F0.toInt()
+private const val C_DIM = 0xFF94A3B8.toInt()
+private const val C_ACC = 0xFF22D3EE.toInt()
 private val COL = mapOf(
     "bdy" to 0xFF2FBF5F.toInt(), "itr" to 0xFFE0443E.toInt(), "wpoint" to 0xFFE0A020.toInt(),
     "opoint" to 0xFF3B82F6.toInt(), "cpoint" to 0xFFA855F7.toInt(), "bpoint" to 0xFF14B8A6.toInt()
