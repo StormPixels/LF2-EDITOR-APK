@@ -29,6 +29,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.documentfile.provider.DocumentFile
 import com.lf2ide.mobile.core.Crypto
+import com.lf2ide.mobile.core.DataEntry
+import com.lf2ide.mobile.core.DataTxt
 import com.lf2ide.mobile.core.FrameParser
 import com.lf2ide.mobile.core.Tokenizer
 
@@ -80,6 +82,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sprites: SpriteStore
     private lateinit var design: DesignPanel
     private lateinit var visual: VisualEditor
+    private lateinit var browser: ProjectBrowser
+    private var project: List<DataEntry> = emptyList()
+    @Volatile private var scanGen = 0
     private lateinit var keysScroll: HorizontalScrollView
     private lateinit var undoBtn: Button
     private lateinit var redoBtn: Button
@@ -121,6 +126,7 @@ class MainActivity : AppCompatActivity() {
             addView(titleName, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(titleStatus)
         }
+        titleBox.setOnClickListener { showProject() }
         val appBar = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL; setBackgroundColor(PANEL); setPadding(dp(4), dp(4), dp(4), dp(4))
             addView(iconBtn(R.drawable.ic_menu) { v -> mainMenu(v) })
@@ -165,6 +171,7 @@ class MainActivity : AppCompatActivity() {
         sprites = SpriteStore(this)
         design = DesignPanel(this, sprites, editor) { pickSprites.launch(arrayOf("image/*")) }
         visual = VisualEditor(this, sprites, editor, { pickSprites.launch(arrayOf("image/*")) }, { treeLauncher.launch(null) })
+        browser = ProjectBrowser(this) { e -> openEntry(e) }
         win = DesignWindow(this, design.root)
         win.onChanged = { layoutWindow() }
         win.onSettled = { saveWindowPrefs() }
@@ -235,6 +242,7 @@ class MainActivity : AppCompatActivity() {
         design.folderSet = rootDoc != null
         visual.folderSet = rootDoc != null
         design.refresh(); visual.refresh()
+        scanProject(fresh)
     }
 
     private fun kids(d: DocumentFile): List<DocumentFile> = synchronized(dirCache) {
@@ -388,11 +396,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun mainMenu(anchor: View) {
         val pm = PopupMenu(this, anchor)
+        pm.menu.add("Proyek (data.txt)…")
         pm.menu.add("Buka file")
         for (n in listOf("Char", "Weapon", "Stage", "Attack", "BG")) pm.menu.add("Baru: $n")
         pm.setOnMenuItemClickListener { item ->
             val t = item.title.toString()
-            if (t == "Buka file") openLauncher.launch(arrayOf("*/*")) else loadTemplate(t.removePrefix("Baru: "))
+            when {
+                t == "Proyek (data.txt)…" -> showProject()
+                t == "Buka file" -> openLauncher.launch(arrayOf("*/*"))
+                else -> loadTemplate(t.removePrefix("Baru: "))
+            }
             true
         }
         pm.show()
@@ -450,11 +463,133 @@ class MainActivity : AppCompatActivity() {
         val bytes = try { contentResolver.openInputStream(uri)?.use { it.readBytes() } } catch (e: Exception) { null }
         if (bytes == null) { toast("Gagal membuka file"); return }
         val name = DocumentFile.fromSingleUri(this, uri)?.name ?: "file.dat"
+        val (text, enc) = decodeDoc(name, bytes)
+        load(text, name, uri, enc)
+    }
+
+    /** Teks file .dat/.txt; bila bukan teks biasa, didekripsi (dan ditandai terenkripsi agar disimpan terenkripsi lagi). */
+    private fun decodeDoc(name: String, bytes: ByteArray): Pair<String, Boolean> {
         var text = String(bytes, Charsets.ISO_8859_1)
         var enc = false
         val isData = Regex("""\.(dat|txt)$""", RegexOption.IGNORE_CASE).containsMatchIn(name)
         if (isData && !PLAIN.containsMatchIn(text)) { text = Crypto.decrypt(bytes); enc = true }
-        load(text, name, uri, enc)
+        return text to enc
+    }
+
+    // ---------- proyek: data/data.txt ----------
+    private fun findDoc(path: String): DocumentFile? {
+        val root = rootDoc ?: return null
+        val segs = path.trim().replace('\\', '/').split('/').filter { it.isNotEmpty() && it != "." }
+        if (segs.isEmpty()) return null
+        var cur: DocumentFile? = root
+        for (s in segs) {
+            val d = cur ?: break
+            cur = kids(d).firstOrNull { it.name.equals(s, ignoreCase = true) }
+        }
+        val f: DocumentFile? = if (cur != null && cur.isFile) cur else null
+        return f ?: byName(segs.last())
+    }
+
+    private fun locateData(base: DocumentFile): DocumentFile? {
+        val d = kids(base).firstOrNull { it.isDirectory && it.name.equals("data", ignoreCase = true) } ?: return null
+        return kids(d).firstOrNull { it.isFile && it.name.equals("data.txt", ignoreCase = true) }
+    }
+
+    /** Cari data/data.txt di folder terpilih (atau subfolder langsungnya, mis. lf2_v2.0a), baca daftar file, lalu pindai nama objek. */
+    private fun scanProject(announce: Boolean) {
+        val top = rootDoc ?: return
+        val gen = ++scanGen
+        Thread {
+            var base: DocumentFile = top
+            var data: DocumentFile? = locateData(base)
+            if (data == null) {
+                for (c in kids(top)) {
+                    if (!c.isDirectory) continue
+                    val d = locateData(c)
+                    if (d != null) { base = c; data = d; break }
+                }
+            }
+            val dd = data
+            if (dd == null) {
+                runOnUiThread {
+                    if (gen == scanGen) {
+                        project = emptyList()
+                        browser.setEntries(emptyList())
+                        if (announce) toast("data/data.txt tidak ditemukan di folder ini")
+                    }
+                }
+                return@Thread
+            }
+            if (base !== top) { rootDoc = base; nameIndex = null }
+            val bytes = try { contentResolver.openInputStream(dd.uri)?.use { it.readBytes() } } catch (e: Exception) { null }
+            if (bytes == null) {
+                runOnUiThread { if (announce) toast("Gagal membaca data.txt") }
+                return@Thread
+            }
+            val list = DataTxt.parse(decodeDoc("data.txt", bytes).first)
+            runOnUiThread {
+                if (gen == scanGen) {
+                    project = list
+                    browser.setEntries(list)
+                    if (announce) {
+                        toast("data.txt: ${list.size} file")
+                        browser.show()
+                    }
+                }
+            }
+            var n = 0
+            for (e in list) {
+                if (gen != scanGen) return@Thread
+                if (e.path.lowercase().endsWith(".dat")) {
+                    val df = findDoc(e.path)
+                    if (df != null) {
+                        try {
+                            val b = contentResolver.openInputStream(df.uri)?.use { it.readBytes() }
+                            if (b != null) e.name = DataTxt.nameOf(decodeDoc(df.name ?: "x.dat", b).first)
+                        } catch (ex: Exception) { }
+                    }
+                }
+                n++
+                if (n % 12 == 0) runOnUiThread { if (gen == scanGen) browser.refresh() }
+            }
+            runOnUiThread { if (gen == scanGen) browser.refresh() }
+        }.start()
+    }
+
+    private fun showProject() {
+        if (project.isEmpty()) {
+            toast(if (rootDoc == null) "Pilih folder game (isi lf2_v2.0a) lebih dulu" else "Belum ada daftar file; data/data.txt tidak ditemukan")
+            return
+        }
+        browser.show()
+    }
+
+    /** Buka satu file dari daftar proyek; bila ada perubahan belum tersimpan, tanya dulu. */
+    private fun openEntry(e: DataEntry) {
+        val go = {
+            Thread {
+                val df = findDoc(e.path)
+                var bytes: ByteArray? = null
+                if (df != null) {
+                    try { bytes = contentResolver.openInputStream(df.uri)?.use { it.readBytes() } } catch (ex: Exception) { }
+                }
+                if (df == null || bytes == null) {
+                    runOnUiThread { toast("File tidak ditemukan: ${e.path}") }
+                } else {
+                    val nm = df.name ?: e.fileName
+                    val (text, enc) = decodeDoc(nm, bytes)
+                    runOnUiThread { load(text, nm, df.uri, enc) }
+                }
+            }.start()
+        }
+        if (dirty) {
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setMessage("Perubahan di $docName belum disimpan.")
+                .setPositiveButton("Simpan") { _, _ -> save(); if (!dirty) go() }
+                .setNeutralButton("Buang") { _, _ -> go() }
+                .setNegativeButton("Batal", null)
+                .show()
+        } else go()
     }
 
     private fun load(text: String, name: String, uri: Uri?, enc: Boolean) {
@@ -560,6 +695,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        private val PLAIN = Regex("""<bmp_begin>|<frame>|<stage>|<background>|^\s*#|\bname:""", RegexOption.MULTILINE)
+        private val PLAIN = Regex("""<bmp_begin>|<frame>|<stage>|<background>|<object>|<file_editing>|^\s*#|\bname:""", RegexOption.MULTILINE)
     }
 }

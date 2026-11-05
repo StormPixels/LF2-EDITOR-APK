@@ -1,5 +1,6 @@
 package com.lf2ide.mobile
 
+import com.lf2ide.mobile.core.DataTxt
 import com.lf2ide.mobile.core.FrameOps
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -161,6 +162,29 @@ class FrameOpsTest {
         val f = hf[0]
         val t2 = vdoc.substring(0, f.s) + "Zero" + vdoc.substring(f.e)
         assertEquals("Zero", FrameOps.headFields(t2)[0].value)
+    }
+
+    // ---------- data.txt ----------
+    @Test
+    fun dataTxtParse() {
+        val txt = "# komentar\r\n<object>\r\nid: 1  type: 0  file: data\\louis.dat\r\nid: 200 type: 3 file: data\\ball.dat # ket\r\n<object_end>\r\n" +
+            "<background>\r\nid: 0  file: bg\\sys\\hwn\\bg.dat\r\n<background_end>\r\n<file_editing>\r\nfile: data\\x.dat\r\n<file_editing_end>\r\n"
+        val l = DataTxt.parse(txt)
+        assertEquals(4, l.size)
+        assertEquals("object", l[0].section)
+        assertEquals(1, l[0].id)
+        assertEquals(0, l[0].type)
+        assertEquals("data\\louis.dat", l[0].path)
+        assertEquals("louis.dat", l[0].fileName)
+        assertEquals("data\\ball.dat", l[1].path) // komentar di belakang dibuang
+        assertEquals(3, l[1].type)
+        assertEquals("background", l[2].section)
+        assertNull(l[2].type)
+        assertEquals("file_editing", l[3].section)
+        assertNull(l[3].id)
+        assertEquals("Davis", DataTxt.nameOf(vdoc))
+        assertNull(DataTxt.nameOf("<frame> 0 a\n<frame_end>"))
+        assertEquals("Objek · Karakter", DataTxt.sectionLabel("object", 0))
     }
 }
 

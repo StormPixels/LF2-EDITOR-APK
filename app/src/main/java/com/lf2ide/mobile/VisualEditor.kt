@@ -408,7 +408,12 @@ class VisualEditor(
         cur = c0
         val he = t.indexOf("<bmp_end>")
         val hk = t.substring(0, if (he < 0) minOf(4000, t.length) else he + 9)
-        if (hk != headKey) { headKey = hk; sheets = Sprites.parseSheets(hk) }
+        if (hk != headKey) {
+            headKey = hk
+            sheets = Sprites.parseSheets(hk)
+            // muat semua lembar gambar yang disebut di header (jalur dicari dari folder game)
+            for (sh in sheets) if (!sprites.has(sh.file)) sprites.request(sh.file) { follow() }
+        }
         val fr = if (c0 != null) parse(t, c0) else null
         frame = fr
         val pic = fr?.top?.get("pic")
