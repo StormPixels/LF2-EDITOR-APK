@@ -108,4 +108,59 @@ class FrameOpsTest {
         assertNotNull(FrameOps.ranges(after).firstOrNull { it.idx == 61 })
         assertEquals(listOf(0, 61, 62, 70), FrameOps.ranges(after).map { it.idx })
     }
+
+    // ---------- editor visual ----------
+    private val head = "<bmp_begin>\nname: Davis\nhead: sprite\\sys\\davis_f.bmp\nfile(0-69): sprite\\sys\\davis_0.bmp  w: 79  h: 79  row: 10  col: 7\nwalking_speed 4.000000\n<bmp_end>\n\n"
+    private val vdoc = head + listOf(
+        fr(0, "standing", 1), fr(1, "standing", 2), fr(2, "standing", 0),
+        "<frame> 5 walking_1\n   pic: 5  state: 1  wait: 3  next: 6  dvx: 4\n   bdy:\n      kind: 0  x: 1  y: 2  w: 3  h: 4\n   bdy_end:\n<frame_end>",
+        "<frame> 6 walking_2\n   pic: 6  state: 1  wait: 3  next: 5\n<frame_end>"
+    ).joinToString("\n\n")
+
+    @Test
+    fun infosAndGroups() {
+        val inf = FrameOps.infos(vdoc)
+        assertEquals(listOf(0, 1, 2, 5, 6), inf.map { it.idx })
+        assertEquals(5, inf[3].pic)
+        assertEquals(3, inf[3].wait)
+        assertEquals(6, inf[3].next)
+        assertEquals("walking_1", inf[3].caption)
+        val g = FrameOps.group(inf)
+        assertEquals(listOf("standing", "walking"), g.map { it.key })
+        assertEquals(listOf(3, 2), g.map { it.frames.size })
+    }
+
+    @Test
+    fun setTopEditsInsertsAndRemoves() {
+        val raw = "<frame> 5 walking_1\n   pic: 5  state: 1  wait: 3  next: 6\n   bdy:\n      kind: 0  x: 1  y: 2  w: 3  h: 4\n   bdy_end:\n<frame_end>"
+        val a = FrameOps.setTop(raw, "wait", "9")
+        assertTrue(a.contains("wait: 9"))
+        assertTrue(a.contains("w: 3")) // w di dalam bdy tidak tersentuh
+        val b = FrameOps.setTop(raw, "dvx", "4")
+        assertTrue(b.startsWith("<frame> 5 walking_1\n   dvx: 4\n"))
+        val c = FrameOps.setTop(raw, "state", null)
+        assertTrue(!c.contains("state"))
+        assertTrue(c.contains("pic: 5") && c.contains("wait: 3"))
+        // field di dalam seksi tidak ikut terbaca sebagai field utama
+        assertNull(FrameOps.intIn(raw, "kind"))
+        // frame tanpa seksi apa pun
+        val d = FrameOps.setTop("<frame> 6 x\n   pic: 6\n<frame_end>", "next", "7")
+        assertTrue(d.contains("next: 7") && d.endsWith("<frame_end>"))
+        // teks (sound)
+        val e = FrameOps.setTop(raw, "sound", "data\\001.wav")
+        assertEquals("data\\001.wav", Regex("sound: (\\S+)").find(e)!!.groupValues[1])
+    }
+
+    @Test
+    fun captionAndHeader() {
+        assertTrue(FrameOps.withCaption("<frame> 5 walking_1\n   pic: 5\n<frame_end>", "jalan").startsWith("<frame> 5 jalan\n"))
+        val hf = FrameOps.headFields(vdoc)
+        assertEquals(listOf("name", "head", "walking_speed"), hf.map { it.key })
+        assertEquals("Davis", hf[0].value)
+        assertEquals("4.000000", hf[2].value)
+        val f = hf[0]
+        val t2 = vdoc.substring(0, f.s) + "Zero" + vdoc.substring(f.e)
+        assertEquals("Zero", FrameOps.headFields(t2)[0].value)
+    }
 }
+

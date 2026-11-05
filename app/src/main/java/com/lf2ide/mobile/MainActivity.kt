@@ -65,7 +65,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val pickSprites = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        for (u in uris) sprites.addFromUri(u) { design.refresh() }
+        for (u in uris) sprites.addFromUri(u) { design.refresh(); visual.refresh() }
     }
 
     private lateinit var content: LinearLayout
@@ -79,6 +79,12 @@ class MainActivity : AppCompatActivity() {
     private var nameIndex: HashMap<String, DocumentFile>? = null
     private lateinit var sprites: SpriteStore
     private lateinit var design: DesignPanel
+    private lateinit var visual: VisualEditor
+    private lateinit var keysScroll: HorizontalScrollView
+    private lateinit var undoBtn: Button
+    private lateinit var redoBtn: Button
+    private var visualMode = false
+    private var winVis = View.VISIBLE
     private lateinit var editor: EditText
     private lateinit var status: TextView
     private lateinit var titleName: TextView
@@ -123,10 +129,16 @@ class MainActivity : AppCompatActivity() {
             addView(iconBtn(R.drawable.ic_save) { save() })
             addView(iconBtn(R.drawable.ic_more) { v -> moreMenu(v) })
         }
+        undoBtn = keyBtn("↶") { editor.onTextContextMenuItem(android.R.id.undo) }
+        redoBtn = keyBtn("↷") { editor.onTextContextMenuItem(android.R.id.redo) }
+        undoBtn.visibility = View.GONE
+        redoBtn.visibility = View.GONE
+        appBar.addView(undoBtn, 2)
+        appBar.addView(redoBtn, 3)
         root.addView(appBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         editor = CodeEditText(this@MainActivity).apply {
-            onSel = { if (ready) { updateStatus(); design.follow() } }
+            onSel = { if (ready) { updateStatus(); design.follow(); visual.follow() } }
             setBackgroundColor(BG)
             setTextColor(FG)
             typeface = Typeface.MONOSPACE
@@ -143,7 +155,7 @@ class MainActivity : AppCompatActivity() {
                 override fun afterTextChanged(s: Editable?) {
                     if (loading) return
                     dirty = true
-                    if (ready) design.follow()
+                    if (ready) { design.follow(); visual.follow() }
                     scheduleHl(true)
                     handler.removeCallbacks(infoRun)
                     handler.postDelayed(infoRun, 900)
@@ -152,6 +164,7 @@ class MainActivity : AppCompatActivity() {
         }
         sprites = SpriteStore(this)
         design = DesignPanel(this, sprites, editor) { pickSprites.launch(arrayOf("image/*")) }
+        visual = VisualEditor(this, sprites, editor, { pickSprites.launch(arrayOf("image/*")) }, { treeLauncher.launch(null) })
         win = DesignWindow(this, design.root)
         win.onChanged = { layoutWindow() }
         win.onSettled = { saveWindowPrefs() }
@@ -171,6 +184,8 @@ class MainActivity : AppCompatActivity() {
         content.addView(editor)
         stage = FrameLayout(this)
         stage.addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        visual.root.visibility = View.GONE
+        stage.addView(visual.root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         applyOrientation()
         root.addView(stage, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         if (pr.getBoolean("win_float", false)) stage.post { setFloating(true, false) }
@@ -179,8 +194,8 @@ class MainActivity : AppCompatActivity() {
         keys.addView(keyBtn("↶") { editor.onTextContextMenuItem(android.R.id.undo) })
         keys.addView(keyBtn("↷") { editor.onTextContextMenuItem(android.R.id.redo) })
         for ((lab, ins) in listOf("Tab" to "   ", "<" to "<", ">" to ">", ":" to ":", "_" to "_", "-" to "-", "#" to "#")) keys.addView(keyBtn(lab) { insertText(ins) })
-        root.addView(HorizontalScrollView(this).apply { addView(keys); isHorizontalScrollBarEnabled = false },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        keysScroll = HorizontalScrollView(this).apply { addView(keys); isHorizontalScrollBarEnabled = false }
+        root.addView(keysScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         status = TextView(this).apply {
             setBackgroundColor(PANEL); setTextColor(DIM); setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -190,6 +205,21 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
         ready = true
         updateStatus()
+        if (pr.getBoolean("visual", true)) setVisual(true)
+    }
+
+    // ---------- mode Visual / Kode ----------
+    private fun setVisual(on: Boolean) {
+        visualMode = on
+        if (on) { winVis = win.visibility; win.visibility = View.GONE } else { win.visibility = winVis }
+        content.visibility = if (on) View.GONE else View.VISIBLE
+        visual.root.visibility = if (on) View.VISIBLE else View.GONE
+        keysScroll.visibility = if (on) View.GONE else View.VISIBLE
+        status.visibility = if (on) View.GONE else View.VISIBLE
+        undoBtn.visibility = if (on) View.VISIBLE else View.GONE
+        redoBtn.visibility = if (on) View.VISIBLE else View.GONE
+        getSharedPreferences("lf2", MODE_PRIVATE).edit().putBoolean("visual", on).apply()
+        if (on) visual.refresh() else design.refresh()
     }
 
     // ---------- folder game & pencarian sprite ----------
@@ -203,7 +233,8 @@ class MainActivity : AppCompatActivity() {
             toast("Folder game: ${rootDoc?.name}")
         }
         design.folderSet = rootDoc != null
-        design.refresh()
+        visual.folderSet = rootDoc != null
+        design.refresh(); visual.refresh()
     }
 
     private fun kids(d: DocumentFile): List<DocumentFile> = synchronized(dirCache) {
@@ -262,7 +293,7 @@ class MainActivity : AppCompatActivity() {
             applyOrientation()
         }
         if (save) saveWindowPrefs()
-        win.post { design.refresh() }
+        win.post { design.refresh(); visual.refresh() }
     }
 
     private fun layoutWindow() {
@@ -277,7 +308,7 @@ class MainActivity : AppCompatActivity() {
             applyOrientation()
         }
         saveWindowPrefs()
-        win.post { design.refresh() }
+        win.post { design.refresh(); visual.refresh() }
     }
 
     private fun saveWindowPrefs() {
@@ -297,6 +328,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyOrientation() {
         val land = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        visual.setLandscape(land)
         content.orientation = if (land) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
         val lp = { if (land) LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f) else LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f) }
         editor.layoutParams = lp()
@@ -370,19 +402,22 @@ class MainActivity : AppCompatActivity() {
         val pm = PopupMenu(this, anchor)
         pm.menu.add("Sprite…")
         pm.menu.add("Simpan sebagai…")
+        val modeLabel = if (visualMode) "Mode: Kode" else "Mode: Visual"
+        pm.menu.add(modeLabel)
         val floatLabel = if (win.floating) "Design: tempel ke layar" else "Design: jadikan mengambang"
         pm.menu.add(floatLabel)
         pm.menu.add("Reset ukuran & posisi Design")
         pm.menu.add("Tampilkan/sembunyikan Design")
         pm.setOnMenuItemClickListener { item ->
             when (item.title.toString()) {
+                modeLabel -> setVisual(!visualMode)
                 "Sprite…" -> pickSprites.launch(arrayOf("image/*"))
                 "Simpan sebagai…" -> saveAsLauncher.launch(docName)
                 floatLabel -> setFloating(!win.floating)
                 "Reset ukuran & posisi Design" -> resetWindow()
                 else -> {
                     win.visibility = if (win.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-                    design.refresh()
+                    design.refresh(); visual.refresh()
                 }
             }
             true

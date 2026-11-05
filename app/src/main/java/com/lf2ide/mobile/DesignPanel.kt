@@ -79,6 +79,12 @@ class DesignCanvas(ctx: Context) : View(ctx) {
     var onDone: (() -> Unit)? = null
     var onTouchStart: (() -> Boolean)? = null // true = sentuhan dipakai (mis. menghentikan putaran), jangan pilih apa pun
 
+    // mode editor visual: kanvas muat di area tersedia (fitW x fitH) lalu dikali zoom; sentuhan di area kosong diteruskan ke scroll
+    var fitW = 0
+    var fitH = 0
+    var zoom = 1f
+    var panOnEmpty = false
+
     // pratinjau animasi: kotak tetap + geser sprite agar titik center sejajar
     var boxW: Int? = null
     var boxH: Int? = null
@@ -116,6 +122,11 @@ class DesignCanvas(ctx: Context) : View(ctx) {
     }
 
     override fun onMeasure(w: Int, h: Int) {
+        if (fitW > 0 && fitH > 0) {
+            val sc = minOf(fitW / ww.toFloat(), fitH / wh.toFloat()) * zoom
+            setMeasuredDimension(maxOf(1, (ww * sc).toInt()), maxOf(1, (wh * sc).toInt()))
+            return
+        }
         val width = MeasureSpec.getSize(w)
         setMeasuredDimension(width, (width * wh / ww.toFloat()).toInt())
     }
@@ -211,6 +222,11 @@ class DesignCanvas(ctx: Context) : View(ctx) {
                 if (onTouchStart?.invoke() == true) return true
                 sel = hit(f, x, y)
                 onSelect?.invoke()
+                if (panOnEmpty && sel == null) {
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                    invalidate()
+                    return false
+                }
                 val o = f.obj(sel)
                 dragging = o != null && o.v.containsKey("x") && o.v.containsKey("y")
                 if (dragging && o != null) {

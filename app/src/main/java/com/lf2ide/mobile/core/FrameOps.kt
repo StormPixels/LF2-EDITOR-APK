@@ -6,6 +6,15 @@ class FrameRange(val idx: Int, val s: Int, val e: Int)
 /** Kepala frame untuk daftar/pencarian: nomor, caption, dan posisi `<frame>`. */
 class FrameHead(val idx: Int, val caption: String, val pos: Int)
 
+/** Ringkasan satu frame untuk daftar visual: field utama dan rentang teksnya. */
+class FrameInfo(val idx: Int, val caption: String, val pic: Int?, val wait: Int, val next: Int?, val s: Int, val e: Int)
+
+/** Frame berurutan dengan nama gerakan yang sama (mis. standing 0-3). */
+class FrameGroup(val key: String, val frames: List<FrameInfo>)
+
+/** Satu baris header karakter (name, head, walking_speed, ...) beserta rentang nilainya di teks. */
+class HeadField(val key: String, val value: String, val s: Int, val e: Int)
+
 /**
  * Operasi teks pada frame (salin frame, salin/tempel move, hapus, cari).
  * Bekerja langsung pada teks mentah supaya field yang tidak dikenal parser tidak hilang.
@@ -133,5 +142,95 @@ object FrameOps {
             j++
         }
         return j
+    }
+
+    // ---------- ringkasan, kelompok, dan penyuntingan field ----------
+    private val SECT = Regex("""(?<![A-Za-z_])(bpoint|opoint|cpoint|wpoint|itr|bdy):""")
+    private val HDR_CAP = Regex("""^(<frame>\s+\d+\s+)\S+""")
+    private val GKEY = Regex("""[_\-]?\d+$""")
+    private val HEADRE = Regex("""(?m)^[ \t]*([A-Za-z_][A-Za-z_0-9]*):?[ \t]+([^\r\n]*?)[ \t]*$""")
+    private val KEYRE = HashMap<String, Regex>()
+
+    private fun keyRe(k: String): Regex =
+        KEYRE.getOrPut(k) { Regex("(?<![A-Za-z_])" + Regex.escape(k) + ":(\\s*)(\\S+)") }
+
+    /** Batas akhir bagian field utama frame (sebelum seksi bdy/itr/point pertama atau <frame_end>). */
+    private fun topLimit(raw: String): Int {
+        val endTok = raw.lastIndexOf("<frame_end>")
+        val limit = if (endTok >= 0) endTok else raw.length
+        val m = SECT.find(raw)
+        return if (m != null) minOf(limit, m.range.first) else limit
+    }
+
+    fun intIn(raw: String, key: String): Int? =
+        keyRe(key).find(raw.substring(0, topLimit(raw)))?.groupValues?.get(2)?.toIntOrNull()
+
+    fun infos(t: String): List<FrameInfo> {
+        val out = ArrayList<FrameInfo>()
+        for (r in ranges(t)) {
+            val raw = t.substring(r.s, r.e)
+            val cap = HDR_NAME.find(raw)?.groupValues?.get(2) ?: ""
+            out.add(FrameInfo(r.idx, cap, intIn(raw, "pic"), intIn(raw, "wait") ?: 0, intIn(raw, "next"), r.s, r.e))
+        }
+        return out
+    }
+
+    fun groupKey(caption: String): String = caption.lowercase().replace(GKEY, "")
+
+    fun group(list: List<FrameInfo>): List<FrameGroup> {
+        val out = ArrayList<FrameGroup>()
+        var curKey: String? = null
+        var buf = ArrayList<FrameInfo>()
+        for (f in list) {
+            val k = groupKey(f.caption)
+            if (k != curKey) {
+                if (buf.isNotEmpty()) out.add(FrameGroup(curKey ?: "", buf))
+                buf = ArrayList()
+                curKey = k
+            }
+            buf.add(f)
+        }
+        if (buf.isNotEmpty()) out.add(FrameGroup(curKey ?: "", buf))
+        return out
+    }
+
+    /**
+     * Ubah (atau hapus bila value null) satu field angka/teks pada bagian utama frame.
+     * Field yang belum ada ditambahkan tepat setelah baris header frame.
+     */
+    fun setTop(raw: String, key: String, value: String?): String {
+        val cut = topLimit(raw)
+        var head = raw.substring(0, cut)
+        val tail = raw.substring(cut)
+        val m = keyRe(key).find(head)
+        if (m != null) {
+            val g = m.groups[2]!!
+            head = if (value == null) {
+                head.substring(0, m.range.first).trimEnd(' ', '\t') + head.substring(m.range.last + 1)
+            } else {
+                head.substring(0, g.range.first) + value + head.substring(g.range.last + 1)
+            }
+        } else if (value != null) {
+            val nl = head.indexOf('\n')
+            head = if (nl >= 0) head.substring(0, nl) + "\n   " + key + ": " + value + head.substring(nl)
+            else head + "\n   " + key + ": " + value
+        }
+        return head + tail
+    }
+
+    /** Ganti caption pada header `<frame> idx caption`. */
+    fun withCaption(raw: String, caption: String): String =
+        HDR_CAP.replace(raw) { m -> m.groupValues[1] + caption }
+
+    /** Baris `kunci nilai` / `kunci: nilai` di header karakter (sebelum frame pertama); baris file(...) tidak ikut. */
+    fun headFields(t: String): List<HeadField> {
+        val fi = t.indexOf("<frame>")
+        val head = t.substring(0, if (fi < 0) t.length else fi)
+        val out = ArrayList<HeadField>()
+        for (m in HEADRE.findAll(head)) {
+            val v = m.groups[2] ?: continue
+            out.add(HeadField(m.groupValues[1], v.value, v.range.first, v.range.last + 1))
+        }
+        return out
     }
 }

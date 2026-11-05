@@ -1,0 +1,2394 @@
+diff --git a/app/src/main/java/com/lf2ide/mobile/DesignPanel.kt b/app/src/main/java/com/lf2ide/mobile/DesignPanel.kt
+index 6545bc8..b170141 100644
+--- a/app/src/main/java/com/lf2ide/mobile/DesignPanel.kt
++++ b/app/src/main/java/com/lf2ide/mobile/DesignPanel.kt
+@@ -1,5 +1,7 @@
+ package com.lf2ide.mobile
+ 
++import android.content.ClipData
++import android.content.ClipboardManager
+ import android.content.Context
+ import android.graphics.Bitmap
+ import android.graphics.BitmapShader
+@@ -15,21 +17,29 @@ import android.view.MotionEvent
+ import android.view.View
+ import android.view.ViewGroup
+ import android.view.inputmethod.EditorInfo
++import android.widget.ArrayAdapter
+ import android.widget.Button
+ import android.widget.CheckBox
+ import android.widget.EditText
+ import android.widget.HorizontalScrollView
+ import android.widget.LinearLayout
++import android.widget.ListView
+ import android.widget.ScrollView
+ import android.widget.TextView
++import android.widget.Toast
++import androidx.appcompat.app.AlertDialog
++import androidx.core.widget.doAfterTextChanged
+ import com.lf2ide.mobile.core.Cell
+ import com.lf2ide.mobile.core.Frame
++import com.lf2ide.mobile.core.FrameHead
++import com.lf2ide.mobile.core.FrameOps
+ import com.lf2ide.mobile.core.FrameParser
+ import com.lf2ide.mobile.core.FrameWriter
+ import com.lf2ide.mobile.core.Schema
+ import com.lf2ide.mobile.core.Sect
+ import com.lf2ide.mobile.core.Sheet
+ import com.lf2ide.mobile.core.Sprites
++import com.lf2ide.mobile.core.Tokenizer
+ import kotlin.math.hypot
+ import kotlin.math.roundToInt
+ 
+@@ -67,9 +77,29 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+     var onSelect: (() -> Unit)? = null
+     var onMoved: (() -> Unit)? = null
+     var onDone: (() -> Unit)? = null
+-
+-    private val ww: Int get() = maxOf(120, (cell?.s?.w ?: 0) + 10)
+-    private val wh: Int get() = maxOf(110, (cell?.s?.h ?: 0) + 10)
++    var onTouchStart: (() -> Boolean)? = null // true = sentuhan dipakai (mis. menghentikan putaran), jangan pilih apa pun
++
++    // mode editor visual: kanvas muat di area tersedia (fitW x fitH) lalu dikali zoom; sentuhan di area kosong diteruskan ke scroll
++    var fitW = 0
++    var fitH = 0
++    var zoom = 1f
++    var panOnEmpty = false
++
++    // pratinjau animasi: kotak tetap + geser sprite agar titik center sejajar
++    var boxW: Int? = null
++    var boxH: Int? = null
++    var offX = 0
++    var offY = 0
++
++    // onion skin (frame sebelumnya)
++    var ghost: Bitmap? = null
++    var ghostCell: Cell? = null
++    var ghostDx = 0
++    var ghostDy = 0
++    private val ghostPaint = Paint().apply { isFilterBitmap = false; alpha = 90 }
++
++    private val ww: Int get() = boxW ?: maxOf(120, (cell?.s?.w ?: 0) + 10)
++    private val wh: Int get() = boxH ?: maxOf(110, (cell?.s?.h ?: 0) + 10)
+     private val bg = Paint()
+     private val bp = Paint().apply { isFilterBitmap = false }
+     private val fill = Paint().apply { style = Paint.Style.FILL }
+@@ -92,6 +122,11 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+     }
+ 
+     override fun onMeasure(w: Int, h: Int) {
++        if (fitW > 0 && fitH > 0) {
++            val sc = minOf(fitW / ww.toFloat(), fitH / wh.toFloat()) * zoom
++            setMeasuredDimension(maxOf(1, (ww * sc).toInt()), maxOf(1, (wh * sc).toInt()))
++            return
++        }
+         val width = MeasureSpec.getSize(w)
+         setMeasuredDimension(width, (width * wh / ww.toFloat()).toInt())
+     }
+@@ -100,6 +135,17 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+         val s = width / ww.toFloat()
+         c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bg)
+         val f = frame ?: return
++        c.save()
++        if (vis["mirror"] == true) c.scale(-1f, 1f, width / 2f, 0f)
++        c.translate(offX * s, offY * s)
++        val gb = ghost
++        val gc = ghostCell
++        if (vis["prev"] == true && gb != null && gc != null) {
++            c.drawBitmap(
++                gb, Rect(gc.sx, gc.sy, gc.sx + gc.s.w, gc.sy + gc.s.h),
++                RectF(ghostDx * s, ghostDy * s, (ghostDx + gc.s.w) * s, (ghostDy + gc.s.h) * s), ghostPaint
++            )
++        }
+         val b = bmp
+         val ce = cell
+         if (b != null && ce != null) {
+@@ -109,8 +155,8 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+             val cx = f.top["centerx"]
+             val cy = f.top["centery"]
+             if (cx != null && cy != null) {
+-                c.drawLine(cx * s, 0f, cx * s, height.toFloat(), line)
+-                c.drawLine(0f, cy * s, width.toFloat(), cy * s, line)
++                c.drawLine(cx * s, -offY * s, cx * s, height - offY * s, line)
++                c.drawLine(-offX * s, cy * s, width - offX * s, cy * s, line)
+             }
+         }
+         for (t in listOf("bdy", "itr")) {
+@@ -138,6 +184,7 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+             fill.color = COL[t]!!
+             c.drawCircle(x * s, y * s, if (sel?.type == t) 7f * s / 2f else 4f * s / 2f, fill)
+         }
++        c.restore()
+     }
+ 
+     private fun hit(f: Frame, x: Float, y: Float): Sel? {
+@@ -166,13 +213,20 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+     override fun onTouchEvent(e: MotionEvent): Boolean {
+         val f = frame ?: return false
+         val s = width / ww.toFloat()
+-        val x = e.x / s
+-        val y = e.y / s
++        val vx = if (vis["mirror"] == true) width - e.x else e.x
++        val x = vx / s - offX
++        val y = e.y / s - offY
+         when (e.actionMasked) {
+             MotionEvent.ACTION_DOWN -> {
+                 parent?.requestDisallowInterceptTouchEvent(true)
++                if (onTouchStart?.invoke() == true) return true
+                 sel = hit(f, x, y)
+                 onSelect?.invoke()
++                if (panOnEmpty && sel == null) {
++                    parent?.requestDisallowInterceptTouchEvent(false)
++                    invalidate()
++                    return false
++                }
+                 val o = f.obj(sel)
+                 dragging = o != null && o.v.containsKey("x") && o.v.containsKey("y")
+                 if (dragging && o != null) {
+@@ -225,13 +279,27 @@ class DesignPanel(
+     private var applying = false
+     var folderSet = false
+ 
++    // pratinjau animasi
++    private var playing = false
++    private val speeds = floatArrayOf(0.25f, 0.5f, 1f, 2f)
++    private var speedI = 2
++    private var seq: Map<Int, Frame> = emptyMap()
++    private var startIdx = 0
++    private var curIdx = 0
++    private var playAx = 0
++    private var playAy = 0
++    private val playRun = Runnable { playTick() }
++    private var btnPlay: Button? = null
++    private var btnSpeed: Button? = null
++
+     fun follow() {
+         if (applying || !root.isShown) return
++        if (playing) { stopPlay(); return }
+         handler.removeCallbacks(run)
+         handler.postDelayed(run, 120)
+     }
+ 
+-    fun refresh() { if (root.isShown) load() }
++    fun refresh() { if (root.isShown && !playing) load() }
+ 
+     private fun load() {
+         val t = ed.text.toString()
+@@ -258,6 +326,7 @@ class DesignPanel(
+         canvas.frame = fr
+         canvas.cell = c
+         canvas.bmp = if (c != null) sprites.peek(c.s.file) else null
++        loadGhost(t, fr)
+         if (fr?.obj(canvas.sel) == null) canvas.sel = null
+         idx.setText(fr?.index?.toString() ?: "")
+         cap.setText(fr?.caption ?: "")
+@@ -377,7 +446,11 @@ class DesignPanel(
+ 
+     private fun gotoFrame(n: Int) {
+         val m = Regex("<frame>\\s+$n\\s").find(ed.text) ?: return
+-        val off = m.range.first + 8
++        gotoOffset(m.range.first + 8)
++    }
++
++    private fun gotoOffset(off0: Int) {
++        val off = off0.coerceIn(0, ed.text.length)
+         ed.setSelection(off)
+         ed.post {
+             val lay = ed.layout
+@@ -385,6 +458,240 @@ class DesignPanel(
+         }
+     }
+ 
++    private fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_SHORT).show()
++
++    // ---------- onion skin ----------
++    private fun loadGhost(t: String, fr: Frame?) {
++        canvas.ghost = null
++        canvas.ghostCell = null
++        if (canvas.vis["prev"] != true || fr == null || rs <= 0) return
++        val ps = t.lastIndexOf("<frame>", rs - 1)
++        if (ps < 0) return
++        val pe = t.indexOf("<frame_end>", ps)
++        if (pe < 0 || pe >= rs) return
++        val pf = try { FrameParser.read(t.substring(ps, pe + 11)) } catch (ex: Exception) { null } ?: return
++        val pp = pf.top["pic"] ?: return
++        val pc = Sprites.cellFor(sheets, pp) ?: return
++        if (!sprites.has(pc.s.file)) sprites.request(pc.s.file) { refresh() }
++        canvas.ghost = sprites.peek(pc.s.file)
++        canvas.ghostCell = pc
++        canvas.ghostDx = (fr.top["centerx"] ?: 0) - (pf.top["centerx"] ?: 0)
++        canvas.ghostDy = (fr.top["centery"] ?: 0) - (pf.top["centery"] ?: 0)
++    }
++
++    // ---------- pratinjau animasi ----------
++    private fun speedText() = "${speeds[speedI]}×".replace(".0×", "×")
++
++    private fun togglePlay() { if (playing) stopPlay() else startPlay() }
++
++    private fun startPlay() {
++        val f = frame
++        if (f == null) { toast("Letakkan kursor di dalam sebuah frame"); return }
++        val m = LinkedHashMap<Int, Frame>()
++        for (raw in Tokenizer.getFrames(ed.text.toString())) {
++            val fr = try { FrameParser.read(raw) } catch (ex: Exception) { null } ?: continue
++            if (!m.containsKey(fr.index)) m[fr.index] = fr
++        }
++        if (!m.containsKey(f.index)) m[f.index] = f
++        seq = m
++        startIdx = f.index
++        val chain = ArrayList<Frame>()
++        val seen = HashSet<Int>()
++        var i = startIdx
++        while (true) {
++            val fr = seq[i] ?: break
++            if (!seen.add(i)) break
++            chain.add(fr)
++            val n = fr.top["next"] ?: break
++            if (n >= 999 || (n == 0 && startIdx != 0)) break
++            i = n
++        }
++        playAx = chain.maxOf { it.top["centerx"] ?: 0 }
++        playAy = chain.maxOf { it.top["centery"] ?: 0 }
++        var mw = 0
++        var mh = 0
++        for (fr in chain) {
++            val pic = fr.top["pic"] ?: continue
++            val c = Sprites.cellFor(sheets, pic) ?: continue
++            mw = maxOf(mw, playAx - (fr.top["centerx"] ?: 0) + c.s.w)
++            mh = maxOf(mh, playAy - (fr.top["centery"] ?: 0) + c.s.h)
++            if (!sprites.has(c.s.file)) sprites.request(c.s.file) { canvas.invalidate() }
++        }
++        canvas.boxW = maxOf(120, mw + 10)
++        canvas.boxH = maxOf(110, mh + 10)
++        canvas.sel = null
++        canvas.ghost = null
++        buildForm()
++        canvas.requestLayout()
++        playing = true
++        btnPlay?.text = "Stop"
++        curIdx = startIdx
++        playTick()
++    }
++
++    private fun stopPlay() {
++        if (!playing) return
++        playing = false
++        handler.removeCallbacks(playRun)
++        btnPlay?.text = "Putar"
++        canvas.offX = 0
++        canvas.offY = 0
++        canvas.boxW = null
++        canvas.boxH = null
++        load()
++    }
++
++    private fun playTick() {
++        if (!playing) return
++        if (!root.isShown) { stopPlay(); return }
++        val fr = seq[curIdx] ?: seq[startIdx]
++        if (fr == null) { stopPlay(); return }
++        val pic = fr.top["pic"]
++        val c = if (pic != null) Sprites.cellFor(sheets, pic) else null
++        canvas.frame = fr
++        canvas.cell = c
++        canvas.bmp = if (c != null) sprites.peek(c.s.file) else null
++        canvas.offX = playAx - (fr.top["centerx"] ?: 0)
++        canvas.offY = playAy - (fr.top["centery"] ?: 0)
++        idx.setText(fr.index.toString())
++        cap.setText(fr.caption)
++        msg.text = "▶ ${fr.index} ${fr.caption} · wait ${fr.top["wait"] ?: 0} · ${speedText()}"
++        canvas.invalidate()
++        val wait = (fr.top["wait"] ?: 0).coerceIn(0, 999)
++        var ms = ((wait + 1) * 1000f / 30f / speeds[speedI]).toLong().coerceAtLeast(16L)
++        val n = fr.top["next"]
++        if (n == null || n >= 999 || !seq.containsKey(n) || (n == 0 && startIdx != 0)) {
++            curIdx = startIdx
++            ms += 300L // jeda singkat sebelum mengulang
++        } else {
++            curIdx = n
++        }
++        handler.postDelayed(playRun, ms)
++    }
++
++    // ---------- navigasi & operasi frame ----------
++    private fun navFrame(dir: Int) {
++        if (playing) stopPlay()
++        val t = ed.text.toString()
++        val cur = if (rs >= 0) rs else t.lastIndexOf("<frame>", maxOf(0, ed.selectionStart))
++        val target = if (dir < 0) {
++            if (cur > 0) t.lastIndexOf("<frame>", cur - 1) else -1
++        } else {
++            t.indexOf("<frame>", if (cur >= 0) cur + 7 else maxOf(0, ed.selectionStart))
++        }
++        if (target < 0) { toast(if (dir < 0) "Ini frame pertama" else "Ini frame terakhir"); return }
++        gotoOffset(target + 8)
++    }
++
++    private fun copyFrame() {
++        if (playing) stopPlay()
++        val f = frame
++        if (f == null || rs < 0) { toast("Letakkan kursor di dalam sebuah frame"); return }
++        val t = ed.text.toString()
++        val used = FrameOps.ranges(t).map { it.idx }.toSet()
++        val ni = FrameOps.freeFrom(used, f.index + 1)
++        if (ni == null) { toast("Tidak ada nomor frame yang kosong"); return }
++        val copy = FrameOps.withIndex(t.substring(rs, re), ni)
++        val at = re
++        ed.text.insert(at, "\n\n" + copy)
++        gotoOffset(at + 2 + 8)
++        toast("Frame $ni dibuat dari ${f.index}")
++    }
++
++    private fun delFrame() {
++        if (playing) stopPlay()
++        val f = frame
++        if (f == null || rs < 0) { toast("Letakkan kursor di dalam sebuah frame"); return }
++        val s0 = rs
++        val e0 = re
++        val refs = FrameOps.referrers(ed.text.toString(), f.index, s0)
++        val m = "Hapus frame ${f.index} (${f.caption})?" +
++            if (refs > 0) "\n$refs frame lain masih menuju frame ini lewat next." else ""
++        AlertDialog.Builder(ctx)
++            .setMessage(m)
++            .setPositiveButton("Hapus") { _, _ ->
++                val t = ed.text.toString()
++                if (s0 >= 0 && e0 <= t.length && t.startsWith("<frame>", s0)) {
++                    ed.text.delete(s0, FrameOps.deleteEnd(t, e0))
++                    ed.setSelection(minOf(s0, ed.text.length))
++                }
++            }
++            .setNegativeButton("Batal", null)
++            .show()
++    }
++
++    private fun copyMove() {
++        if (playing) stopPlay()
++        val f = frame
++        if (f == null || rs < 0) { toast("Letakkan kursor di dalam sebuah frame"); return }
++        if (f.index == 0) { toast("Mulai dari frame selain 0"); return }
++        val raws = FrameOps.chain(ed.text.toString(), f.index)
++        if (raws.isEmpty()) return
++        MoveClip.frames = raws
++        try {
++            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++            cm.setPrimaryClip(ClipData.newPlainText("lf2 move", raws.joinToString("\n\n")))
++        } catch (ex: Exception) { }
++        val ids = raws.map { FrameOps.indexOf(it) ?: -1 }
++        toast("Move disalin: ${raws.size} frame (${ids.first()}…${ids.last()})")
++    }
++
++    private fun pasteMove() {
++        if (playing) stopPlay()
++        var src = MoveClip.frames
++        if (src.isEmpty()) {
++            try {
++                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++                val txt = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(ctx)?.toString() ?: ""
++                src = Tokenizer.getFrames(txt)
++            } catch (ex: Exception) { }
++        }
++        if (src.isEmpty()) { toast("Belum ada move yang disalin"); return }
++        val t = ed.text.toString()
++        val used = FrameOps.ranges(t).map { it.idx }.toSet()
++        val cur = if (rs >= 0) frame?.index else null
++        val base = (cur ?: (used.maxOrNull() ?: 0)) + 1
++        val out = FrameOps.relocate(src, used, base)
++        if (out == null) { toast("Tidak cukup nomor frame yang kosong"); return }
++        val at = if (rs >= 0) re else t.length
++        ed.text.insert(at, "\n\n" + out.joinToString("\n\n"))
++        gotoOffset(at + 2 + 8)
++        toast("Move ditempel: ${out.size} frame")
++    }
++
++    private fun search() {
++        if (playing) stopPlay()
++        val all = FrameOps.headers(ed.text.toString())
++        if (all.isEmpty()) { toast("Tidak ada frame"); return }
++        val box = LinearLayout(ctx).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(dp(ctx, 16), dp(ctx, 8), dp(ctx, 16), 0)
++        }
++        val input = EditText(ctx).apply { hint = "nomor atau nama frame"; setSingleLine() }
++        val list = ListView(ctx)
++        val rows = ArrayList<String>()
++        val adapter = ArrayAdapter(ctx, android.R.layout.simple_list_item_1, rows)
++        list.adapter = adapter
++        var shown: List<FrameHead> = all
++        fun refill() {
++            val q = input.text.toString().trim().lowercase()
++            shown = if (q.isEmpty()) all else all.filter { it.idx.toString().startsWith(q) || it.caption.lowercase().contains(q) }
++            rows.clear()
++            rows.addAll(shown.take(300).map { "${it.idx}   ${it.caption}" })
++            adapter.notifyDataSetChanged()
++        }
++        input.doAfterTextChanged { refill() }
++        box.addView(input)
++        box.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(ctx, 280)))
++        val dlg = AlertDialog.Builder(ctx).setTitle("Cari frame").setView(box).setNegativeButton("Tutup", null).create()
++        list.setOnItemClickListener { _, _, pos, _ ->
++            shown.getOrNull(pos)?.let { gotoOffset(it.pos + 8) }
++            dlg.dismiss()
++        }
++        refill()
++        dlg.show()
++    }
++
+     private fun smallButton(t: String, click: () -> Unit) = Button(ctx).apply {
+         text = t; isAllCaps = false; textSize = 12f
+         setPadding(dp(ctx, 4), 0, dp(ctx, 4), 0)
+@@ -422,10 +729,13 @@ class DesignPanel(
+         col.addView(head)
+ 
+         val visRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+-        for ((k, l) in listOf("bdy" to "bdy", "itr" to "itr", "wpoint" to "w", "opoint" to "o", "cpoint" to "c", "bpoint" to "b", "center" to "center")) {
++        for ((k, l) in listOf("bdy" to "bdy", "itr" to "itr", "wpoint" to "w", "opoint" to "o", "cpoint" to "c", "bpoint" to "b", "center" to "center", "prev" to "prev", "mirror" to "mirror")) {
+             visRow.addView(CheckBox(ctx).apply {
+-                text = l; isChecked = true; setTextColor(C_FG); textSize = 12f
+-                setOnCheckedChangeListener { _, on -> canvas.vis[k] = on; canvas.invalidate() }
++                text = l; isChecked = (k != "prev" && k != "mirror"); setTextColor(C_FG); textSize = 12f
++                setOnCheckedChangeListener { _, on ->
++                    canvas.vis[k] = on
++                    if (k == "prev") refresh() else canvas.invalidate()
++                }
+             })
+         }
+         col.addView(HorizontalScrollView(ctx).apply { addView(visRow); isHorizontalScrollBarEnabled = false })
+@@ -443,6 +753,25 @@ class DesignPanel(
+         btns.addView(smallButton("↻") { load() }, lp())
+         col.addView(btns)
+ 
++        val navRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
++        navRow.addView(smallButton("◀") { navFrame(-1) }, lp())
++        val bp = smallButton("Putar") { togglePlay() }
++        btnPlay = bp
++        navRow.addView(bp, lp())
++        navRow.addView(smallButton("▶") { navFrame(1) }, lp())
++        val bs = smallButton(speedText()) { speedI = (speedI + 1) % speeds.size; btnSpeed?.text = speedText() }
++        btnSpeed = bs
++        navRow.addView(bs, lp())
++        navRow.addView(smallButton("Cari") { search() }, lp())
++        col.addView(navRow)
++
++        val opRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
++        opRow.addView(smallButton("Salin frame") { copyFrame() }, lp())
++        opRow.addView(smallButton("Hapus frame") { delFrame() }, lp())
++        opRow.addView(smallButton("Salin move") { copyMove() }, lp())
++        opRow.addView(smallButton("Tempel move") { pasteMove() }, lp())
++        col.addView(opRow)
++
+         formBox.orientation = LinearLayout.VERTICAL
+         formBox.setPadding(0, dp(ctx, 8), 0, 0)
+         col.addView(formBox)
+@@ -450,6 +779,12 @@ class DesignPanel(
+         canvas.onSelect = { buildForm() }
+         canvas.onMoved = { fields["x"]?.setText(canvas.frame?.obj(canvas.sel)?.v?.get("x")?.toString() ?: ""); fields["y"]?.setText(canvas.frame?.obj(canvas.sel)?.v?.get("y")?.toString() ?: "") }
+         canvas.onDone = { apply() }
++        canvas.onTouchStart = { if (playing) { stopPlay(); true } else false }
+         note()
+     }
+ }
++
++/** Penampung move yang disalin (frame mentah), bisa ditempel ke file lain. */
++object MoveClip {
++    var frames: List<String> = emptyList()
++}
+diff --git a/app/src/main/java/com/lf2ide/mobile/FrameActions.kt b/app/src/main/java/com/lf2ide/mobile/FrameActions.kt
+new file mode 100644
+index 0000000..aef6d16
+--- /dev/null
++++ b/app/src/main/java/com/lf2ide/mobile/FrameActions.kt
+@@ -0,0 +1,85 @@
++package com.lf2ide.mobile
++
++import android.content.ClipData
++import android.content.ClipboardManager
++import android.content.Context
++import android.widget.EditText
++import android.widget.Toast
++import androidx.appcompat.app.AlertDialog
++import com.lf2ide.mobile.core.FrameInfo
++import com.lf2ide.mobile.core.FrameOps
++import com.lf2ide.mobile.core.Tokenizer
++
++/** Salin/hapus frame dan salin/tempel move pada teks editor; `goto` memindahkan kursor ke posisi teks tertentu. */
++class FrameActions(
++    private val ctx: Context,
++    private val ed: EditText,
++    private val goto: (Int) -> Unit
++) {
++    private fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_SHORT).show()
++
++    fun copyFrame(cur: FrameInfo?) {
++        if (cur == null) { toast("Pilih sebuah frame dulu"); return }
++        val t = ed.text.toString()
++        if (cur.e > t.length || !t.startsWith("<frame>", cur.s)) return
++        val used = FrameOps.ranges(t).map { it.idx }.toSet()
++        val ni = FrameOps.freeFrom(used, cur.idx + 1)
++        if (ni == null) { toast("Tidak ada nomor frame yang kosong"); return }
++        ed.text.insert(cur.e, "\n\n" + FrameOps.withIndex(t.substring(cur.s, cur.e), ni))
++        goto(cur.e + 2 + 8)
++        toast("Frame $ni dibuat dari ${cur.idx}")
++    }
++
++    fun delete(cur: FrameInfo?) {
++        if (cur == null) { toast("Pilih sebuah frame dulu"); return }
++        val refs = FrameOps.referrers(ed.text.toString(), cur.idx, cur.s)
++        val m = "Hapus frame ${cur.idx} (${cur.caption})?" +
++            if (refs > 0) "\n$refs frame lain masih menuju frame ini lewat next." else ""
++        AlertDialog.Builder(ctx)
++            .setMessage(m)
++            .setPositiveButton("Hapus") { _, _ ->
++                val t = ed.text.toString()
++                if (cur.e <= t.length && t.startsWith("<frame>", cur.s)) {
++                    ed.text.delete(cur.s, FrameOps.deleteEnd(t, cur.e))
++                    ed.setSelection(minOf(cur.s, ed.text.length))
++                }
++            }
++            .setNegativeButton("Batal", null)
++            .show()
++    }
++
++    fun copyMove(cur: FrameInfo?) {
++        if (cur == null) { toast("Pilih sebuah frame dulu"); return }
++        if (cur.idx == 0) { toast("Mulai dari frame selain 0"); return }
++        val raws = FrameOps.chain(ed.text.toString(), cur.idx)
++        if (raws.isEmpty()) return
++        MoveClip.frames = raws
++        try {
++            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++            cm.setPrimaryClip(ClipData.newPlainText("lf2 move", raws.joinToString("\n\n")))
++        } catch (ex: Exception) { }
++        val ids = raws.map { FrameOps.indexOf(it) ?: -1 }
++        toast("Move disalin: ${raws.size} frame (${ids.first()}…${ids.last()})")
++    }
++
++    fun pasteMove(cur: FrameInfo?) {
++        var src = MoveClip.frames
++        if (src.isEmpty()) {
++            try {
++                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++                val txt = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(ctx)?.toString() ?: ""
++                src = Tokenizer.getFrames(txt)
++            } catch (ex: Exception) { }
++        }
++        if (src.isEmpty()) { toast("Belum ada move yang disalin"); return }
++        val t = ed.text.toString()
++        val used = FrameOps.ranges(t).map { it.idx }.toSet()
++        val base = (cur?.idx ?: (used.maxOrNull() ?: 0)) + 1
++        val out = FrameOps.relocate(src, used, base)
++        if (out == null) { toast("Tidak cukup nomor frame yang kosong"); return }
++        val at = cur?.e ?: t.length
++        ed.text.insert(at, "\n\n" + out.joinToString("\n\n"))
++        goto(at + 2 + 8)
++        toast("Move ditempel: ${out.size} frame")
++    }
++}
+diff --git a/app/src/main/java/com/lf2ide/mobile/MainActivity.kt b/app/src/main/java/com/lf2ide/mobile/MainActivity.kt
+index b4c3946..06f9108 100644
+--- a/app/src/main/java/com/lf2ide/mobile/MainActivity.kt
++++ b/app/src/main/java/com/lf2ide/mobile/MainActivity.kt
+@@ -65,7 +65,7 @@ class MainActivity : AppCompatActivity() {
+     }
+ 
+     private val pickSprites = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+-        for (u in uris) sprites.addFromUri(u) { design.refresh() }
++        for (u in uris) sprites.addFromUri(u) { design.refresh(); visual.refresh() }
+     }
+ 
+     private lateinit var content: LinearLayout
+@@ -79,6 +79,12 @@ class MainActivity : AppCompatActivity() {
+     private var nameIndex: HashMap<String, DocumentFile>? = null
+     private lateinit var sprites: SpriteStore
+     private lateinit var design: DesignPanel
++    private lateinit var visual: VisualEditor
++    private lateinit var keysScroll: HorizontalScrollView
++    private lateinit var undoBtn: Button
++    private lateinit var redoBtn: Button
++    private var visualMode = false
++    private var winVis = View.VISIBLE
+     private lateinit var editor: EditText
+     private lateinit var status: TextView
+     private lateinit var titleName: TextView
+@@ -123,10 +129,16 @@ class MainActivity : AppCompatActivity() {
+             addView(iconBtn(R.drawable.ic_save) { save() })
+             addView(iconBtn(R.drawable.ic_more) { v -> moreMenu(v) })
+         }
++        undoBtn = keyBtn("↶") { editor.onTextContextMenuItem(android.R.id.undo) }
++        redoBtn = keyBtn("↷") { editor.onTextContextMenuItem(android.R.id.redo) }
++        undoBtn.visibility = View.GONE
++        redoBtn.visibility = View.GONE
++        appBar.addView(undoBtn, 2)
++        appBar.addView(redoBtn, 3)
+         root.addView(appBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+ 
+         editor = CodeEditText(this@MainActivity).apply {
+-            onSel = { if (ready) { updateStatus(); design.follow() } }
++            onSel = { if (ready) { updateStatus(); design.follow(); visual.follow() } }
+             setBackgroundColor(BG)
+             setTextColor(FG)
+             typeface = Typeface.MONOSPACE
+@@ -143,7 +155,7 @@ class MainActivity : AppCompatActivity() {
+                 override fun afterTextChanged(s: Editable?) {
+                     if (loading) return
+                     dirty = true
+-                    if (ready) design.follow()
++                    if (ready) { design.follow(); visual.follow() }
+                     scheduleHl(true)
+                     handler.removeCallbacks(infoRun)
+                     handler.postDelayed(infoRun, 900)
+@@ -152,6 +164,7 @@ class MainActivity : AppCompatActivity() {
+         }
+         sprites = SpriteStore(this)
+         design = DesignPanel(this, sprites, editor) { pickSprites.launch(arrayOf("image/*")) }
++        visual = VisualEditor(this, sprites, editor, { pickSprites.launch(arrayOf("image/*")) }, { treeLauncher.launch(null) })
+         win = DesignWindow(this, design.root)
+         win.onChanged = { layoutWindow() }
+         win.onSettled = { saveWindowPrefs() }
+@@ -171,6 +184,8 @@ class MainActivity : AppCompatActivity() {
+         content.addView(editor)
+         stage = FrameLayout(this)
+         stage.addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
++        visual.root.visibility = View.GONE
++        stage.addView(visual.root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+         applyOrientation()
+         root.addView(stage, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+         if (pr.getBoolean("win_float", false)) stage.post { setFloating(true, false) }
+@@ -179,8 +194,8 @@ class MainActivity : AppCompatActivity() {
+         keys.addView(keyBtn("↶") { editor.onTextContextMenuItem(android.R.id.undo) })
+         keys.addView(keyBtn("↷") { editor.onTextContextMenuItem(android.R.id.redo) })
+         for ((lab, ins) in listOf("Tab" to "   ", "<" to "<", ">" to ">", ":" to ":", "_" to "_", "-" to "-", "#" to "#")) keys.addView(keyBtn(lab) { insertText(ins) })
+-        root.addView(HorizontalScrollView(this).apply { addView(keys); isHorizontalScrollBarEnabled = false },
+-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
++        keysScroll = HorizontalScrollView(this).apply { addView(keys); isHorizontalScrollBarEnabled = false }
++        root.addView(keysScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+ 
+         status = TextView(this).apply {
+             setBackgroundColor(PANEL); setTextColor(DIM); setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+@@ -190,6 +205,21 @@ class MainActivity : AppCompatActivity() {
+         setContentView(root)
+         ready = true
+         updateStatus()
++        if (pr.getBoolean("visual", true)) setVisual(true)
++    }
++
++    // ---------- mode Visual / Kode ----------
++    private fun setVisual(on: Boolean) {
++        visualMode = on
++        if (on) { winVis = win.visibility; win.visibility = View.GONE } else { win.visibility = winVis }
++        content.visibility = if (on) View.GONE else View.VISIBLE
++        visual.root.visibility = if (on) View.VISIBLE else View.GONE
++        keysScroll.visibility = if (on) View.GONE else View.VISIBLE
++        status.visibility = if (on) View.GONE else View.VISIBLE
++        undoBtn.visibility = if (on) View.VISIBLE else View.GONE
++        redoBtn.visibility = if (on) View.VISIBLE else View.GONE
++        getSharedPreferences("lf2", MODE_PRIVATE).edit().putBoolean("visual", on).apply()
++        if (on) visual.refresh() else design.refresh()
+     }
+ 
+     // ---------- folder game & pencarian sprite ----------
+@@ -203,7 +233,8 @@ class MainActivity : AppCompatActivity() {
+             toast("Folder game: ${rootDoc?.name}")
+         }
+         design.folderSet = rootDoc != null
+-        design.refresh()
++        visual.folderSet = rootDoc != null
++        design.refresh(); visual.refresh()
+     }
+ 
+     private fun kids(d: DocumentFile): List<DocumentFile> = synchronized(dirCache) {
+@@ -262,7 +293,7 @@ class MainActivity : AppCompatActivity() {
+             applyOrientation()
+         }
+         if (save) saveWindowPrefs()
+-        win.post { design.refresh() }
++        win.post { design.refresh(); visual.refresh() }
+     }
+ 
+     private fun layoutWindow() {
+@@ -277,7 +308,7 @@ class MainActivity : AppCompatActivity() {
+             applyOrientation()
+         }
+         saveWindowPrefs()
+-        win.post { design.refresh() }
++        win.post { design.refresh(); visual.refresh() }
+     }
+ 
+     private fun saveWindowPrefs() {
+@@ -297,6 +328,7 @@ class MainActivity : AppCompatActivity() {
+ 
+     private fun applyOrientation() {
+         val land = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
++        visual.setLandscape(land)
+         content.orientation = if (land) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+         val lp = { if (land) LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f) else LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f) }
+         editor.layoutParams = lp()
+@@ -370,19 +402,22 @@ class MainActivity : AppCompatActivity() {
+         val pm = PopupMenu(this, anchor)
+         pm.menu.add("Sprite…")
+         pm.menu.add("Simpan sebagai…")
++        val modeLabel = if (visualMode) "Mode: Kode" else "Mode: Visual"
++        pm.menu.add(modeLabel)
+         val floatLabel = if (win.floating) "Design: tempel ke layar" else "Design: jadikan mengambang"
+         pm.menu.add(floatLabel)
+         pm.menu.add("Reset ukuran & posisi Design")
+         pm.menu.add("Tampilkan/sembunyikan Design")
+         pm.setOnMenuItemClickListener { item ->
+             when (item.title.toString()) {
++                modeLabel -> setVisual(!visualMode)
+                 "Sprite…" -> pickSprites.launch(arrayOf("image/*"))
+                 "Simpan sebagai…" -> saveAsLauncher.launch(docName)
+                 floatLabel -> setFloating(!win.floating)
+                 "Reset ukuran & posisi Design" -> resetWindow()
+                 else -> {
+                     win.visibility = if (win.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+-                    design.refresh()
++                    design.refresh(); visual.refresh()
+                 }
+             }
+             true
+diff --git a/app/src/main/java/com/lf2ide/mobile/VisualEditor.kt b/app/src/main/java/com/lf2ide/mobile/VisualEditor.kt
+new file mode 100644
+index 0000000..08ce899
+--- /dev/null
++++ b/app/src/main/java/com/lf2ide/mobile/VisualEditor.kt
+@@ -0,0 +1,1061 @@
++package com.lf2ide.mobile
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.graphics.Paint
++import android.graphics.Rect
++import android.graphics.RectF
++import android.graphics.drawable.GradientDrawable
++import android.media.MediaPlayer
++import android.os.Handler
++import android.os.Looper
++import android.text.InputType
++import android.view.Gravity
++import android.view.View
++import android.view.ViewGroup
++import android.view.inputmethod.EditorInfo
++import android.widget.BaseAdapter
++import android.widget.Button
++import android.widget.EditText
++import android.widget.FrameLayout
++import android.widget.HorizontalScrollView
++import android.widget.LinearLayout
++import android.widget.ListView
++import android.widget.ScrollView
++import android.widget.TextView
++import androidx.appcompat.app.AlertDialog
++import androidx.core.widget.doAfterTextChanged
++import com.lf2ide.mobile.core.Cell
++import com.lf2ide.mobile.core.FieldDef
++import com.lf2ide.mobile.core.Frame
++import com.lf2ide.mobile.core.FrameGroup
++import com.lf2ide.mobile.core.FrameInfo
++import com.lf2ide.mobile.core.FrameOps
++import com.lf2ide.mobile.core.FrameParser
++import com.lf2ide.mobile.core.FrameWriter
++import com.lf2ide.mobile.core.HeadField
++import com.lf2ide.mobile.core.Labels
++import com.lf2ide.mobile.core.Schema
++import com.lf2ide.mobile.core.Sect
++import com.lf2ide.mobile.core.Sheet
++import com.lf2ide.mobile.core.Sprites
++import com.lf2ide.mobile.core.Tokenizer
++import java.io.File
++
++private const val V_BG = 0xFF0B1220.toInt()
++private const val V_PANEL = 0xFF111B2E.toInt()
++private const val V_LINE = 0xFF22324D.toInt()
++private const val V_FG = 0xFFE2E8F0.toInt()
++private const val V_DIM = 0xFF94A3B8.toInt()
++private const val V_ACC = 0xFF22D3EE.toInt()
++private const val V_SEL = 0xFF14365A.toInt()
++private const val V_SEC = 0xFFD4A72C.toInt()
++private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
++private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
++private val V_POINTS = listOf("wpoint", "opoint", "cpoint", "bpoint")
++
++/** Satu baris pada daftar frame kiri: judul grup (info == null) atau satu frame. */
++private class Row(val group: FrameGroup, val info: FrameInfo?, val gid: String)
++
++/** Potongan sprite kecil untuk daftar dan filmstrip. */
++private class ThumbView(ctx: Context) : View(ctx) {
++    var bmp: Bitmap? = null
++    var cell: Cell? = null
++    private val p = Paint().apply { isFilterBitmap = false }
++
++    override fun onDraw(c: Canvas) {
++        val b = bmp ?: return
++        val ce = cell ?: return
++        if (ce.s.w <= 0 || ce.s.h <= 0 || width <= 0 || height <= 0) return
++        val sc = minOf(width / ce.s.w.toFloat(), height / ce.s.h.toFloat())
++        val w = ce.s.w * sc
++        val h = ce.s.h * sc
++        val l = (width - w) / 2f
++        val t = (height - h) / 2f
++        c.drawBitmap(b, Rect(ce.sx, ce.sy, ce.sx + ce.s.w, ce.sy + ce.s.h), RectF(l, t, l + w, t + h), p)
++    }
++}
++
++/**
++ * Editor visual (landscape tiga kolom): daftar frame berkelompok, kanvas, panel field, dan filmstrip.
++ * Sumber data tetap teks di EditText `ed`; kursor di dalam sebuah frame menentukan frame yang aktif.
++ */
++class VisualEditor(
++    private val ctx: Context,
++    private val sprites: SpriteStore,
++    private val ed: EditText,
++    private val pickSprite: () -> Unit,
++    private val openFolder: () -> Unit
++) {
++    val root = LinearLayout(ctx)
++    var folderSet = false
++
++    private val handler = Handler(Looper.getMainLooper())
++    private val loadRun = Runnable { load(true) }
++    private val thumbRun = Runnable { listAdapter.notifyDataSetChanged(); rebuildStrip() }
++
++    // data
++    private var infos: List<FrameInfo> = emptyList()
++    private var groups: List<FrameGroup> = emptyList()
++    private var cur: FrameInfo? = null
++    private var frame: Frame? = null
++    private var sheets: List<Sheet> = emptyList()
++    private var headKey = ""
++    private var applying = false
++    private var tab = 0
++    private var lastCurIdx = -1
++    private val expanded = HashSet<String>()
++    private val rows = ArrayList<Row>()
++    private val hints = HashMap<String, TextView>()
++    private val boxFields = HashMap<String, EditText>()
++
++    // tampilan
++    private val canvas = DesignCanvas(ctx)
++    private val search = EditText(ctx)
++    private val list = ListView(ctx)
++    private val listPanel = LinearLayout(ctx)
++    private val centerPanel = LinearLayout(ctx)
++    private val rightPanel = LinearLayout(ctx)
++    private val form = LinearLayout(ctx)
++    private val descTv = TextView(ctx)
++    private val msgTv = TextView(ctx)
++    private val strip = LinearLayout(ctx)
++    private val stripScroll = HorizontalScrollView(ctx)
++    private val body = LinearLayout(ctx)
++    private val bottom = LinearLayout(ctx)
++    private val tabBtns = ArrayList<TextView>()
++    private var btnPlay: Button? = null
++    private var btnSpeed: Button? = null
++    private var btnFind: Button? = null
++    private var btnZoom: Button? = null
++    private val listAdapter = ListAdapter()
++    private val actions = FrameActions(ctx, ed) { off -> gotoOffset(off) }
++
++    // pratinjau animasi
++    private var playing = false
++    private val speeds = floatArrayOf(0.25f, 0.5f, 1f, 2f)
++    private var speedI = 2
++    private var moveOn = false
++    private var soundOn = false
++    private var seq: Map<Int, Frame> = emptyMap()
++    private var startIdx = 0
++    private var curIdx = 0
++    private var playAx = 0
++    private var playAy = 0
++    private var playMinPx = 0
++    private var pxMap: Map<Int, Int> = emptyMap()
++    private val playRun = Runnable { playTick() }
++
++    init {
++        root.orientation = LinearLayout.VERTICAL
++        root.setBackgroundColor(V_BG)
++        buildLeft()
++        buildCenter()
++        buildRight()
++        buildBottom()
++        root.addView(body, LinearLayout.LayoutParams(MATCH, 0, 1f))
++        root.addView(bottom, LinearLayout.LayoutParams(MATCH, WRAP))
++        layoutFor(true)
++
++        canvas.panOnEmpty = true
++        canvas.vis["center"] = true
++        canvas.onTouchStart = { if (playing) { stopPlay(); true } else false }
++        canvas.onSelect = { if (tab == 1) buildTab() }
++        canvas.onMoved = { syncBoxFields() }
++        canvas.onDone = { applyFrame(); if (tab == 1) buildTab() }
++    }
++
++    // ---------- API untuk MainActivity ----------
++    fun setLandscape(land: Boolean) = layoutFor(land)
++
++    fun refresh() { if (root.isShown && !playing) load(true) }
++
++    fun follow() {
++        if (applying || !root.isShown) return
++        if (playing) { stopPlay(); return }
++        handler.removeCallbacks(loadRun)
++        handler.postDelayed(loadRun, 120)
++    }
++
++    // ---------- helper tampilan ----------
++    private fun dp(v: Int) = (v * ctx.resources.displayMetrics.density).toInt()
++
++    private fun lp(w: Int, h: Int, wt: Float = 0f) = LinearLayout.LayoutParams(w, h, wt)
++
++    private fun tv(text: String, size: Float, color: Int): TextView = TextView(ctx).apply {
++        this.text = text
++        textSize = size
++        setTextColor(color)
++    }
++
++    private fun sbtn(label: String, onClick: () -> Unit): Button = Button(ctx).apply {
++        text = label
++        isAllCaps = false
++        textSize = 12f
++        setTextColor(V_FG)
++        setBackgroundColor(V_BG)
++        minWidth = 0
++        minimumWidth = 0
++        minHeight = 0
++        minimumHeight = dp(34)
++        setPadding(dp(6), 0, dp(6), 0)
++        setOnClickListener { onClick() }
++    }
++
++    private fun chip(label: String, on: Boolean, change: (Boolean) -> Unit): TextView {
++        val v = TextView(ctx)
++        var state = on
++        fun paint() {
++            v.setTextColor(if (state) V_BG else V_FG)
++            v.background = GradientDrawable().apply {
++                cornerRadius = dp(6).toFloat()
++                setColor(if (state) V_ACC else V_PANEL)
++                setStroke(dp(1), if (state) V_ACC else V_LINE)
++            }
++        }
++        v.text = label
++        v.textSize = 12f
++        v.gravity = Gravity.CENTER
++        v.setPadding(dp(10), dp(6), dp(10), dp(6))
++        paint()
++        v.setOnClickListener { state = !state; paint(); change(state) }
++        return v
++    }
++
++    private fun inputBox(value: String, numeric: Boolean, onFocus: () -> Unit, onCommit: (String) -> Unit): EditText =
++        EditText(ctx).apply {
++            inputType = if (numeric) InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED else InputType.TYPE_CLASS_TEXT
++            setSingleLine()
++            textSize = 13f
++            setTextColor(V_FG)
++            setBackgroundColor(V_BG)
++            setPadding(dp(8), dp(6), dp(8), dp(6))
++            imeOptions = EditorInfo.IME_ACTION_DONE
++            setText(value)
++            setOnFocusChangeListener { _, has -> if (has) onFocus() else onCommit(this.text.toString()) }
++            setOnEditorActionListener { v, _, _ -> onCommit(v.text.toString()); v.clearFocus(); true }
++        }
++
++    // ---------- membangun panel ----------
++    private fun buildLeft() {
++        listPanel.orientation = LinearLayout.VERTICAL
++        listPanel.setBackgroundColor(V_PANEL)
++        search.hint = "Cari frame"
++        search.setSingleLine()
++        search.textSize = 13f
++        search.setTextColor(V_FG)
++        search.setHintTextColor(V_DIM)
++        search.setBackgroundColor(V_BG)
++        search.setPadding(dp(8), dp(6), dp(8), dp(6))
++        search.doAfterTextChanged { rebuildRows() }
++        listPanel.addView(search, lp(MATCH, WRAP).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) })
++        val acts = LinearLayout(ctx)
++        acts.addView(sbtn("Salin") { actions.copyFrame(cur) }, lp(0, WRAP, 1f))
++        acts.addView(sbtn("Hapus") { actions.delete(cur) }, lp(0, WRAP, 1f))
++        acts.addView(sbtn("Salin move") { actions.copyMove(cur) }, lp(0, WRAP, 1.4f))
++        acts.addView(sbtn("Tempel") { actions.pasteMove(cur) }, lp(0, WRAP, 1f))
++        listPanel.addView(acts, lp(MATCH, WRAP))
++        list.adapter = listAdapter
++        list.divider = null
++        list.setOnItemClickListener { _, _, pos, _ -> onRowClick(pos) }
++        listPanel.addView(list, lp(MATCH, 0, 1f))
++    }
++
++    private fun buildCenter() {
++        centerPanel.orientation = LinearLayout.VERTICAL
++        val chips = LinearLayout(ctx)
++        chips.gravity = Gravity.CENTER_VERTICAL
++        chips.setPadding(dp(4), dp(4), dp(4), dp(4))
++        fun add(label: String, on: Boolean, keys: List<String>) {
++            for (k in keys) canvas.vis[k] = on
++            val c = chip(label, on) { v ->
++                for (k in keys) canvas.vis[k] = v
++                if (keys[0] == "prev") load(false) else canvas.invalidate()
++            }
++            chips.addView(c, lp(WRAP, WRAP).apply { setMargins(dp(2), 0, dp(2), 0) })
++        }
++        add("tubuh", true, listOf("bdy"))
++        add("serangan", true, listOf("itr"))
++        add("titik", true, V_POINTS)
++        add("sebelumnya", false, listOf("prev"))
++        add("cermin", false, listOf("mirror"))
++        val z = sbtn("Zoom 1×") {
++            val n = if (canvas.zoom >= 4f) 1f else canvas.zoom + 1f
++            canvas.zoom = n
++            btnZoom?.text = "Zoom ${n.toInt()}×"
++            canvas.requestLayout()
++        }
++        btnZoom = z
++        chips.addView(z, lp(WRAP, WRAP).apply { setMargins(dp(6), 0, dp(2), 0) })
++        val cs = HorizontalScrollView(ctx)
++        cs.isHorizontalScrollBarEnabled = false
++        cs.addView(chips)
++        centerPanel.addView(cs, lp(MATCH, WRAP))
++
++        val holder = FrameLayout(ctx)
++        holder.addView(canvas, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.CENTER))
++        val hs = HorizontalScrollView(ctx)
++        hs.isFillViewport = true
++        hs.addView(holder, FrameLayout.LayoutParams(WRAP, MATCH))
++        val vs = ScrollView(ctx)
++        vs.isFillViewport = true
++        vs.addView(hs, FrameLayout.LayoutParams(MATCH, MATCH))
++        vs.addOnLayoutChangeListener { _, l, t, r, b, _, _, _, _ ->
++            val w = r - l
++            val h = b - t
++            if (w > 0 && h > 0 && (w != canvas.fitW || h != canvas.fitH)) {
++                canvas.fitW = w
++                canvas.fitH = h
++                canvas.post { canvas.requestLayout() }
++            }
++        }
++        centerPanel.addView(vs, lp(MATCH, 0, 1f))
++
++        msgTv.textSize = 12f
++        msgTv.setTextColor(V_DIM)
++        msgTv.setPadding(dp(8), dp(2), dp(8), dp(2))
++        centerPanel.addView(msgTv, lp(MATCH, WRAP))
++    }
++
++    private fun buildRight() {
++        rightPanel.orientation = LinearLayout.VERTICAL
++        rightPanel.setBackgroundColor(V_PANEL)
++        val tabs = LinearLayout(ctx)
++        val names = listOf("Frame", "Kotak", "Gambar", "Karakter")
++        for ((i, n) in names.withIndex()) {
++            val v = TextView(ctx)
++            v.text = n
++            v.textSize = 13f
++            v.gravity = Gravity.CENTER
++            v.setOnClickListener { tab = i; paintTabs(); buildTab() }
++            tabBtns.add(v)
++            tabs.addView(v, lp(0, dp(38), 1f))
++        }
++        paintTabs()
++        rightPanel.addView(tabs, lp(MATCH, WRAP))
++        descTv.textSize = 12f
++        descTv.setTextColor(V_ACC)
++        descTv.setPadding(dp(10), dp(6), dp(10), dp(4))
++        rightPanel.addView(descTv, lp(MATCH, WRAP))
++        form.orientation = LinearLayout.VERTICAL
++        form.setPadding(dp(10), dp(4), dp(10), dp(16))
++        val sv = ScrollView(ctx)
++        sv.addView(form, FrameLayout.LayoutParams(MATCH, WRAP))
++        rightPanel.addView(sv, lp(MATCH, 0, 1f))
++    }
++
++    private fun paintTabs() {
++        for ((i, v) in tabBtns.withIndex()) {
++            v.setTextColor(if (i == tab) V_BG else V_FG)
++            v.setBackgroundColor(if (i == tab) V_ACC else V_PANEL)
++        }
++    }
++
++    private fun buildBottom() {
++        bottom.orientation = LinearLayout.HORIZONTAL
++        bottom.gravity = Gravity.CENTER_VERTICAL
++        bottom.setBackgroundColor(V_PANEL)
++        bottom.setPadding(dp(4), dp(4), dp(4), dp(4))
++        bottom.addView(sbtn("|◀") { navFrame(-1) }, lp(WRAP, dp(44)))
++        val bp = sbtn("Putar") { togglePlay() }
++        btnPlay = bp
++        bottom.addView(bp, lp(WRAP, dp(44)))
++        bottom.addView(sbtn("▶|") { navFrame(1) }, lp(WRAP, dp(44)))
++        val bs = sbtn(speedText()) { speedI = (speedI + 1) % speeds.size; btnSpeed?.text = speedText() }
++        btnSpeed = bs
++        bottom.addView(bs, lp(WRAP, dp(44)))
++        val cm = chip("dengan gerak", false) { v -> moveOn = v; if (playing) { stopPlay(); startPlay() } }
++        bottom.addView(cm, lp(WRAP, WRAP).apply { setMargins(dp(4), 0, dp(2), 0) })
++        val cs = chip("suara", false) { v -> soundOn = v }
++        bottom.addView(cs, lp(WRAP, WRAP).apply { setMargins(dp(2), 0, dp(4), 0) })
++        val bf = sbtn("Cari") { searchDialog() }
++        btnFind = bf
++        bottom.addView(bf, lp(WRAP, dp(44)))
++        stripScroll.isHorizontalScrollBarEnabled = false
++        stripScroll.addView(strip, FrameLayout.LayoutParams(WRAP, MATCH))
++        strip.orientation = LinearLayout.HORIZONTAL
++        bottom.addView(stripScroll, lp(0, dp(68), 1f))
++    }
++
++    private fun layoutFor(land: Boolean) {
++        body.removeAllViews()
++        if (land) {
++            body.orientation = LinearLayout.HORIZONTAL
++            body.addView(listPanel, lp(0, MATCH, 2.2f))
++            body.addView(centerPanel, lp(0, MATCH, 4.2f))
++            body.addView(rightPanel, lp(0, MATCH, 3.4f))
++        } else {
++            body.orientation = LinearLayout.VERTICAL
++            body.addView(centerPanel, lp(MATCH, 0, 5f))
++            body.addView(rightPanel, lp(MATCH, 0, 4f))
++        }
++        btnFind?.visibility = if (land) View.GONE else View.VISIBLE
++    }
++
++    // ---------- memuat frame aktif ----------
++    private fun parse(t: String, f: FrameInfo): Frame? =
++        try { FrameParser.read(t.substring(f.s, f.e)) } catch (ex: Exception) { null }
++
++    private fun load(rebuildForm: Boolean) {
++        val t = ed.text.toString()
++        infos = FrameOps.infos(t)
++        groups = FrameOps.group(infos)
++        val off = maxOf(0, ed.selectionStart)
++        val c0 = infos.firstOrNull { off >= it.s && off < it.e }
++            ?: infos.lastOrNull { it.s <= off }
++            ?: infos.firstOrNull()
++        cur = c0
++        val he = t.indexOf("<bmp_end>")
++        val hk = t.substring(0, if (he < 0) minOf(4000, t.length) else he + 9)
++        if (hk != headKey) { headKey = hk; sheets = Sprites.parseSheets(hk) }
++        val fr = if (c0 != null) parse(t, c0) else null
++        frame = fr
++        val pic = fr?.top?.get("pic")
++        val cl = if (pic != null) Sprites.cellFor(sheets, pic) else null
++        if (cl != null && !sprites.has(cl.s.file)) sprites.request(cl.s.file) { refresh() }
++        canvas.frame = fr
++        canvas.cell = cl
++        canvas.bmp = if (cl != null) sprites.peek(cl.s.file) else null
++        if (fr?.obj(canvas.sel) == null) canvas.sel = null
++        loadGhost(c0, fr, t)
++        canvas.requestLayout()
++        canvas.invalidate()
++        msgTv.text = if (c0 == null) "Tidak ada frame — gunakan mode Kode untuk menambah"
++        else "Frame ${c0.idx} · ${c0.caption} · ${Labels.groupName(FrameOps.groupKey(c0.caption))}"
++
++        var scroll = false
++        if (c0 != null && c0.idx != lastCurIdx) {
++            lastCurIdx = c0.idx
++            val g = groups.firstOrNull { gr -> gr.frames.any { it.s == c0.s } }
++            if (g != null) expanded.add(g.key + "@" + g.frames.first().idx)
++            scroll = true
++        }
++        rebuildRows()
++        if (scroll && c0 != null) {
++            val pos = rows.indexOfFirst { it.info?.s == c0.s }
++            if (pos >= 0) list.post { list.setSelectionFromTop(pos, dp(80)) }
++        }
++        rebuildStrip()
++        if (rebuildForm) buildTab() else updateHints()
++    }
++
++    private fun loadGhost(c0: FrameInfo?, fr: Frame?, t: String) {
++        canvas.ghost = null
++        canvas.ghostCell = null
++        if (canvas.vis["prev"] != true || c0 == null || fr == null) return
++        val i = infos.indexOfFirst { it.s == c0.s }
++        if (i <= 0) return
++        val pf = parse(t, infos[i - 1]) ?: return
++        val pp = pf.top["pic"] ?: return
++        val pc = Sprites.cellFor(sheets, pp) ?: return
++        if (!sprites.has(pc.s.file)) sprites.request(pc.s.file) { refresh() }
++        canvas.ghost = sprites.peek(pc.s.file)
++        canvas.ghostCell = pc
++        canvas.ghostDx = (fr.top["centerx"] ?: 0) - (pf.top["centerx"] ?: 0)
++        canvas.ghostDy = (fr.top["centery"] ?: 0) - (pf.top["centery"] ?: 0)
++    }
++
++    private fun gotoOffset(off: Int) {
++        if (playing) stopPlay()
++        ed.setSelection(off.coerceIn(0, ed.text.length))
++        follow()
++    }
++
++    private fun gotoInfo(inf: FrameInfo) = gotoOffset(inf.s + 8)
++
++    private fun navFrame(dir: Int) {
++        if (playing) stopPlay()
++        val c0 = cur ?: return
++        val i = infos.indexOfFirst { it.s == c0.s }
++        val t = infos.getOrNull(i + dir) ?: return
++        gotoInfo(t)
++    }
++
++    // ---------- daftar frame ----------
++    private fun rebuildRows() {
++        val q = search.text.toString().trim().lowercase()
++        rows.clear()
++        for (g in groups) {
++            val label = Labels.groupName(g.key)
++            val gid = g.key + "@" + g.frames.first().idx
++            val matches = if (q.isEmpty()) g.frames else g.frames.filter {
++                it.idx.toString().startsWith(q) || it.caption.lowercase().contains(q) || label.lowercase().contains(q)
++            }
++            if (matches.isEmpty()) continue
++            rows.add(Row(g, null, gid))
++            if (q.isNotEmpty() || expanded.contains(gid)) for (f in matches) rows.add(Row(g, f, gid))
++        }
++        listAdapter.notifyDataSetChanged()
++    }
++
++    private fun onRowClick(pos: Int) {
++        val r = rows.getOrNull(pos) ?: return
++        val inf = r.info
++        if (inf == null) {
++            if (!expanded.add(r.gid)) expanded.remove(r.gid)
++            rebuildRows()
++        } else {
++            gotoInfo(inf)
++        }
++    }
++
++    private fun thumb(pic: Int?): ThumbView {
++        val v = ThumbView(ctx)
++        val c = if (pic != null) Sprites.cellFor(sheets, pic) else null
++        if (c != null) {
++            val b = sprites.peek(c.s.file)
++            if (b != null) {
++                v.bmp = b
++                v.cell = c
++            } else if (!sprites.has(c.s.file)) {
++                sprites.request(c.s.file) { handler.removeCallbacks(thumbRun); handler.postDelayed(thumbRun, 80) }
++            }
++        }
++        return v
++    }
++
++    private inner class ListAdapter : BaseAdapter() {
++        override fun getCount(): Int = rows.size
++        override fun getItem(position: Int): Any = rows[position]
++        override fun getItemId(position: Int): Long = position.toLong()
++
++        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
++            val r = rows[position]
++            val inf = r.info
++            val row = LinearLayout(ctx)
++            row.gravity = Gravity.CENTER_VERTICAL
++            if (inf == null) {
++                row.setPadding(dp(8), dp(10), dp(8), dp(10))
++                val open = expanded.contains(r.gid) || search.text.isNotEmpty()
++                row.addView(tv(if (open) "▾" else "▸", 14f, V_DIM), lp(dp(18), WRAP))
++                row.addView(tv(Labels.groupName(r.group.key), 14f, V_FG), lp(0, WRAP, 1f))
++                row.addView(tv(r.group.frames.size.toString(), 12f, V_DIM), lp(WRAP, WRAP))
++            } else {
++                row.setPadding(dp(22), dp(2), dp(8), dp(2))
++                row.setBackgroundColor(if (inf.s == cur?.s) V_SEL else 0)
++                row.addView(thumb(inf.pic), lp(dp(30), dp(30)))
++                row.addView(tv(inf.idx.toString(), 13f, V_FG).apply { setPadding(dp(8), 0, dp(8), 0) }, lp(0, WRAP, 1f))
++                row.addView(tv("waktu ${inf.wait}", 12f, V_DIM), lp(WRAP, WRAP))
++            }
++            return row
++        }
++    }
++
++    private fun rebuildStrip() {
++        strip.removeAllViews()
++        val c0 = cur ?: return
++        val g = groups.firstOrNull { gr -> gr.frames.any { it.s == c0.s } } ?: return
++        var curView: View? = null
++        for (inf in g.frames) {
++            val cv = LinearLayout(ctx)
++            cv.orientation = LinearLayout.VERTICAL
++            cv.gravity = Gravity.CENTER_HORIZONTAL
++            cv.setPadding(dp(4), dp(2), dp(4), dp(2))
++            cv.setBackgroundColor(if (inf.s == c0.s) V_SEL else V_PANEL)
++            cv.addView(thumb(inf.pic), lp(dp(34), dp(34)))
++            cv.addView(tv(inf.idx.toString(), 11f, V_FG), lp(WRAP, WRAP))
++            cv.addView(tv("waktu ${inf.wait}", 10f, V_DIM), lp(WRAP, WRAP))
++            cv.setOnClickListener { gotoInfo(inf) }
++            strip.addView(cv, lp(WRAP, MATCH).apply { setMargins(dp(2), 0, dp(2), 0) })
++            if (inf.s == c0.s) curView = cv
++        }
++        val sel = curView
++        if (sel != null) stripScroll.post { stripScroll.smoothScrollTo(maxOf(0, sel.left - dp(80)), 0) }
++    }
++
++    private fun searchDialog() {
++        val all = FrameOps.headers(ed.text.toString())
++        if (all.isEmpty()) return
++        val box = LinearLayout(ctx)
++        box.orientation = LinearLayout.VERTICAL
++        box.setPadding(dp(16), dp(8), dp(16), 0)
++        val input = EditText(ctx)
++        input.hint = "nomor atau nama frame"
++        input.setSingleLine()
++        val lv = ListView(ctx)
++        val labels = ArrayList<String>()
++        val adapter = android.widget.ArrayAdapter(ctx, android.R.layout.simple_list_item_1, labels)
++        lv.adapter = adapter
++        var shown = all
++        fun refill() {
++            val q = input.text.toString().trim().lowercase()
++            shown = if (q.isEmpty()) all else all.filter { it.idx.toString().startsWith(q) || it.caption.lowercase().contains(q) }
++            labels.clear()
++            labels.addAll(shown.take(300).map { "${it.idx}   ${it.caption}" })
++            adapter.notifyDataSetChanged()
++        }
++        input.doAfterTextChanged { refill() }
++        box.addView(input)
++        box.addView(lv, lp(MATCH, dp(280)))
++        val dlg = AlertDialog.Builder(ctx).setTitle("Cari frame").setView(box).setNegativeButton("Tutup", null).create()
++        lv.setOnItemClickListener { _, _, pos, _ ->
++            shown.getOrNull(pos)?.let { gotoOffset(it.pos + 8) }
++            dlg.dismiss()
++        }
++        refill()
++        dlg.show()
++    }
++
++    // ---------- panel kanan ----------
++    private fun buildTab() {
++        form.removeAllViews()
++        hints.clear()
++        boxFields.clear()
++        descTv.text = ""
++        when (tab) {
++            0 -> buildFrameTab()
++            1 -> buildBoxTab()
++            2 -> buildPicTab()
++            else -> buildHeadTab()
++        }
++    }
++
++    private fun updateHints() {
++        val f = frame
++        for ((k, v) in hints) {
++            val value = f?.top?.get(k)
++            v.text = if (k == "state") (value?.let { Labels.STATE[it] } ?: "") else Labels.refHint(k, value, infos)
++        }
++    }
++
++    private fun buildFrameTab() {
++        val c0 = cur
++        val f = frame
++        if (c0 == null || f == null) {
++            form.addView(tv("Tidak ada frame yang bisa dibaca di file ini.", 13f, V_DIM))
++            return
++        }
++        descTv.text = "Ketuk kolom untuk melihat fungsinya"
++        form.addView(tv("Frame ${c0.idx}", 18f, V_FG))
++        for (sec in Labels.FRAME_SECTIONS) {
++            val h = tv(sec.title, 13f, V_SEC)
++            h.setPadding(0, dp(10), 0, dp(2))
++            form.addView(h)
++            var i = 0
++            while (i < sec.fields.size) {
++                val r = LinearLayout(ctx)
++                for (j in i until minOf(i + 2, sec.fields.size)) {
++                    r.addView(fieldCell(sec.fields[j], c0, f), lp(0, WRAP, 1f).apply { setMargins(0, 0, dp(6), 0) })
++                }
++                if (i + 1 >= sec.fields.size) r.addView(View(ctx), lp(0, 1, 1f))
++                form.addView(r)
++                i += 2
++            }
++        }
++        updateHints()
++    }
++
++    private fun fieldCell(def: FieldDef, c0: FrameInfo, f: Frame): View {
++        val col = LinearLayout(ctx)
++        col.orientation = LinearLayout.VERTICAL
++        col.setPadding(0, dp(4), 0, dp(2))
++        val top = LinearLayout(ctx)
++        top.addView(tv(def.label, 13f, V_FG), lp(0, WRAP, 1f))
++        top.addView(tv(def.key, 10f, V_DIM), lp(WRAP, WRAP))
++        col.addView(top)
++        val value = when {
++            def.key == "caption" -> c0.caption
++            def.key == "sound" -> f.sound ?: ""
++            else -> f.top[def.key]?.toString() ?: ""
++        }
++        val et = inputBox(value, !def.text,
++            { descTv.text = def.label + " (" + def.key + "): " + def.desc },
++            { v -> commitField(def, v) })
++        col.addView(et, lp(MATCH, WRAP))
++        if (def.ref || def.key == "state") {
++            val h = tv("", 11f, V_DIM)
++            hints[def.key] = h
++            col.addView(h)
++        }
++        return col
++    }
++
++    private fun commitField(def: FieldDef, v: String) {
++        val t = v.trim()
++        when {
++            def.key == "caption" -> {
++                val cap = t.replace(Regex("\\s+"), "_")
++                if (cap.isEmpty()) return
++                editRaw { FrameOps.withCaption(it, cap) }
++            }
++            def.text -> {
++                val s = t.replace(Regex("\\s+"), "")
++                editRaw { FrameOps.setTop(it, def.key, if (s.isEmpty()) null else s) }
++            }
++            t.isEmpty() -> editRaw { FrameOps.setTop(it, def.key, null) }
++            else -> {
++                val n = t.toIntOrNull() ?: return
++                editRaw { FrameOps.setTop(it, def.key, n.toString()) }
++            }
++        }
++    }
++
++    /** Ubah teks mentah frame aktif (field yang tak dikenal parser tetap utuh). */
++    private fun editRaw(tr: (String) -> String) {
++        val c0 = cur ?: return
++        val t = ed.text.toString()
++        if (c0.e > t.length || !t.startsWith("<frame>", c0.s)) return
++        val raw = t.substring(c0.s, c0.e)
++        val nr = tr(raw)
++        if (nr == raw) return
++        applying = true
++        try {
++            ed.text.replace(c0.s, c0.e, nr)
++            ed.setSelection(minOf(c0.s + 8, ed.text.length))
++        } catch (ex: Exception) {
++        } finally {
++            applying = false
++        }
++        load(false)
++    }
++
++    // ---------- tab Kotak ----------
++    private fun buildBoxTab() {
++        val f = frame
++        if (f == null) {
++            form.addView(tv("Pilih sebuah frame dulu.", 13f, V_DIM))
++            return
++        }
++        val bar = LinearLayout(ctx)
++        bar.addView(sbtn("+ tubuh") { addBox("bdy") }, lp(0, WRAP, 1f))
++        bar.addView(sbtn("+ serangan") { addBox("itr") }, lp(0, WRAP, 1f))
++        bar.addView(sbtn("Hapus") { deleteSel() }, lp(0, WRAP, 1f))
++        form.addView(bar)
++        val bar2 = LinearLayout(ctx)
++        for (p in V_POINTS) {
++            val has = f.points.containsKey(p)
++            bar2.addView(sbtn((if (has) "− " else "+ ") + p) { togglePoint(p) }, lp(0, WRAP, 1f))
++        }
++        form.addView(bar2)
++        val s = canvas.sel
++        for ((i, b) in f.bdys.withIndex()) form.addView(boxRow("bdy", i, "tubuh #${i + 1}", b, s))
++        for ((i, b) in f.itrs.withIndex()) form.addView(boxRow("itr", i, "serangan #${i + 1}", b, s))
++        for (p in V_POINTS) f.points[p]?.let { form.addView(boxRow(p, 0, p, it, s)) }
++        val o = f.obj(s)
++        if (s == null || o == null) {
++            descTv.text = "Ketuk kotak atau titik, di daftar atau di kanvas, untuk mengubahnya"
++            return
++        }
++        descTv.text = ""
++        val items = ArrayList<Pair<String, String>>()
++        for ((k, _) in Schema.fields[s.type] ?: emptyList()) items.add(k to k)
++        for (p in Schema.pairs[s.type] ?: emptyList()) { items.add(p.first to p.second); items.add("" to p.third) }
++        val h = tv("Ubah " + s.type, 13f, V_SEC)
++        h.setPadding(0, dp(10), 0, dp(2))
++        form.addView(h)
++        var i = 0
++        while (i < items.size) {
++            val r = LinearLayout(ctx)
++            for (j in i until minOf(i + 2, items.size)) {
++                val (lab, key) = items[j]
++                val cellBox = LinearLayout(ctx)
++                cellBox.orientation = LinearLayout.VERTICAL
++                cellBox.setPadding(0, dp(3), dp(6), dp(3))
++                cellBox.addView(tv(if (lab.isEmpty()) " " else lab, 11f, V_DIM))
++                val et = inputBox(o.v[key]?.toString() ?: "", true, { }, { v -> commitBox(key, v) })
++                boxFields[key] = et
++                cellBox.addView(et, lp(MATCH, WRAP))
++                r.addView(cellBox, lp(0, WRAP, 1f))
++            }
++            form.addView(r)
++            i += 2
++        }
++    }
++
++    private fun boxRow(type: String, i: Int, label: String, o: Sect, sel: com.lf2ide.mobile.Sel?): View {
++        val on = sel != null && sel.type == type && sel.i == i
++        val parts = ArrayList<String>()
++        for (k in listOf("x", "y", "w", "h")) o.v[k]?.let { parts.add("$k $it") }
++        val r = tv(label + "   " + parts.joinToString(" "), 13f, if (on) V_BG else V_FG)
++        r.setPadding(dp(8), dp(8), dp(8), dp(8))
++        r.setBackgroundColor(if (on) V_ACC else V_BG)
++        r.setOnClickListener {
++            canvas.sel = com.lf2ide.mobile.Sel(type, i)
++            canvas.invalidate()
++            buildTab()
++        }
++        val box = LinearLayout(ctx)
++        box.setPadding(0, dp(2), 0, dp(2))
++        box.addView(r, lp(MATCH, WRAP))
++        return box
++    }
++
++    private fun syncBoxFields() {
++        val o = frame?.obj(canvas.sel) ?: return
++        for ((k, et) in boxFields) {
++            if (k == "x" || k == "y") et.setText((o.v[k] ?: 0).toString())
++        }
++    }
++
++    private fun commitBox(key: String, v: String) {
++        val o = frame?.obj(canvas.sel) ?: return
++        val t = v.trim()
++        if (t.isEmpty()) {
++            o.v.remove(key)
++        } else {
++            val n = t.toIntOrNull() ?: return
++            o.v[key] = n
++        }
++        applyFrame()
++        canvas.invalidate()
++    }
++
++    private fun addBox(t: String) {
++        val f = frame ?: return
++        val s = Sect(t)
++        s.v["kind"] = 0
++        s.v["x"] = 20
++        s.v["y"] = 20
++        s.v["w"] = 30
++        s.v["h"] = 30
++        if (t == "itr") s.v["injury"] = 10
++        val l = if (t == "itr") f.itrs else f.bdys
++        l.add(s)
++        canvas.sel = com.lf2ide.mobile.Sel(t, l.size - 1)
++        applyFrame()
++        canvas.invalidate()
++        buildTab()
++    }
++
++    private fun togglePoint(t: String) {
++        val f = frame ?: return
++        if (f.points.containsKey(t)) {
++            f.points.remove(t)
++            if (canvas.sel?.type == t) canvas.sel = null
++        } else {
++            val s = Sect(t)
++            for ((k, _) in Schema.fields[t] ?: emptyList()) s.v[k] = 0
++            if (s.v.containsKey("kind")) s.v["kind"] = 1
++            s.v["x"] = 20
++            s.v["y"] = 20
++            f.points[t] = s
++            canvas.sel = com.lf2ide.mobile.Sel(t, 0)
++        }
++        applyFrame()
++        canvas.invalidate()
++        buildTab()
++    }
++
++    private fun deleteSel() {
++        val f = frame ?: return
++        val s = canvas.sel ?: return
++        when (s.type) {
++            "itr" -> if (s.i < f.itrs.size) f.itrs.removeAt(s.i)
++            "bdy" -> if (s.i < f.bdys.size) f.bdys.removeAt(s.i)
++            else -> f.points.remove(s.type)
++        }
++        canvas.sel = null
++        applyFrame()
++        canvas.invalidate()
++        buildTab()
++    }
++
++    /** Tulis ulang frame aktif dari modelnya (dipakai untuk perubahan kotak/titik). */
++    private fun applyFrame() {
++        val f = frame ?: return
++        val c0 = cur ?: return
++        val t = ed.text.toString()
++        if (c0.e > t.length || !t.startsWith("<frame>", c0.s)) return
++        applying = true
++        try {
++            ed.text.replace(c0.s, c0.e, FrameWriter.frameToString(f))
++            ed.setSelection(minOf(c0.s + 8, ed.text.length))
++        } catch (ex: Exception) {
++        } finally {
++            applying = false
++        }
++        val t2 = ed.text.toString()
++        infos = FrameOps.infos(t2)
++        groups = FrameOps.group(infos)
++        cur = infos.firstOrNull { it.s == c0.s } ?: cur
++        rebuildRows()
++        rebuildStrip()
++    }
++
++    // ---------- tab Gambar ----------
++    private fun buildPicTab() {
++        val pic = frame?.top?.get("pic")
++        form.addView(tv(if (pic != null) "Sprite nomor $pic" else "Frame ini belum punya nomor gambar", 16f, V_FG))
++        val cl = if (pic != null) Sprites.cellFor(sheets, pic) else null
++        val info = if (cl != null) {
++            "Lembar: ${cl.s.name}  (${cl.s.w}×${cl.s.h}, ${cl.s.row}×${cl.s.col})" +
++                if (sprites.has(cl.s.file)) "" else "\nGambar belum dimuat"
++        } else "Lembar untuk nomor ini tidak ditemukan di header"
++        form.addView(tv(info, 13f, V_DIM))
++        val bar = LinearLayout(ctx)
++        bar.addView(sbtn("Pilih sprite…") { pickSprite() }, lp(0, WRAP, 1f))
++        bar.addView(sbtn("Folder game…") { openFolder() }, lp(0, WRAP, 1f))
++        form.addView(bar)
++        if (!folderSet) form.addView(tv("Pilih folder game agar sprite dimuat otomatis dari jalur di header.", 12f, V_DIM))
++        val h = tv("LEMBAR DI HEADER", 13f, V_SEC)
++        h.setPadding(0, dp(10), 0, dp(2))
++        form.addView(h)
++        for (s in sheets) form.addView(tv("${s.start}–${s.end}   ${s.name}   ${s.w}×${s.h}   ${s.row}×${s.col}", 12f, V_FG))
++    }
++
++    // ---------- tab Karakter ----------
++    private fun buildHeadTab() {
++        val hf = FrameOps.headFields(ed.text.toString())
++        if (hf.isEmpty()) {
++            form.addView(tv("Tidak ada data header di file ini.", 13f, V_DIM))
++            return
++        }
++        descTv.text = "Ketuk kolom lalu ubah nilainya"
++        val h = tv("HEADER", 13f, V_SEC)
++        h.setPadding(0, dp(4), 0, dp(2))
++        form.addView(h)
++        for (f in hf) form.addView(headRow(f))
++    }
++
++    private fun headRow(h: HeadField): View {
++        val r = LinearLayout(ctx)
++        r.gravity = Gravity.CENTER_VERTICAL
++        r.setPadding(0, dp(3), 0, dp(3))
++        val name = Labels.headName(h.key)
++        r.addView(tv(name, 12f, V_DIM), lp(0, WRAP, 1f))
++        val et = inputBox(h.value, false, { descTv.text = name + " (" + h.key + ")" }, { v -> commitHead(h.key, v) })
++        r.addView(et, lp(dp(150), WRAP))
++        return r
++    }
++
++    private fun commitHead(key: String, v: String) {
++        val t = v.trim()
++        val f = FrameOps.headFields(ed.text.toString()).firstOrNull { it.key == key } ?: return
++        if (f.value == t) return
++        applying = true
++        try {
++            ed.text.replace(f.s, f.e, t)
++        } catch (ex: Exception) {
++        } finally {
++            applying = false
++        }
++        load(false)
++    }
++
++    // ---------- pratinjau animasi ----------
++    private fun speedText() = "${speeds[speedI]}×".replace(".0×", "×")
++
++    private fun togglePlay() { if (playing) stopPlay() else startPlay() }
++
++    private fun startPlay() {
++        val f = frame
++        if (f == null) return
++        val m = LinkedHashMap<Int, Frame>()
++        for (raw in Tokenizer.getFrames(ed.text.toString())) {
++            val fr = try { FrameParser.read(raw) } catch (ex: Exception) { null } ?: continue
++            if (!m.containsKey(fr.index)) m[fr.index] = fr
++        }
++        if (!m.containsKey(f.index)) m[f.index] = f
++        seq = m
++        startIdx = f.index
++        val chain = ArrayList<Frame>()
++        val seen = HashSet<Int>()
++        var i = startIdx
++        while (true) {
++            val fr = seq[i] ?: break
++            if (!seen.add(i)) break
++            chain.add(fr)
++            val n = fr.top["next"] ?: break
++            if (n >= 999 || (n == 0 && startIdx != 0)) break
++            i = n
++        }
++        playAx = chain.maxOf { it.top["centerx"] ?: 0 }
++        playAy = chain.maxOf { it.top["centery"] ?: 0 }
++        // perkiraan gerak horizontal (dvx x lama frame) bila "dengan gerak" aktif
++        val pm = HashMap<Int, Int>()
++        var px = 0
++        var minPx = 0
++        var maxPx = 0
++        if (moveOn) {
++            for (fr in chain) {
++                pm[fr.index] = px
++                val dv = fr.top["dvx"]
++                if (dv != null && dv > -500 && dv < 500) px += dv * ((fr.top["wait"] ?: 0) + 1)
++                px = px.coerceIn(-300, 300)
++                minPx = minOf(minPx, px)
++                maxPx = maxOf(maxPx, px)
++            }
++        }
++        pxMap = pm
++        playMinPx = minPx
++        var mw = 0
++        var mh = 0
++        for (fr in chain) {
++            val pic = fr.top["pic"] ?: continue
++            val c = Sprites.cellFor(sheets, pic) ?: continue
++            mw = maxOf(mw, playAx - (fr.top["centerx"] ?: 0) + c.s.w)
++            mh = maxOf(mh, playAy - (fr.top["centery"] ?: 0) + c.s.h)
++            if (!sprites.has(c.s.file)) sprites.request(c.s.file) { canvas.invalidate() }
++        }
++        canvas.boxW = maxOf(120, mw + (maxPx - minPx) + 10)
++        canvas.boxH = maxOf(110, mh + 10)
++        canvas.sel = null
++        canvas.ghost = null
++        canvas.requestLayout()
++        playing = true
++        btnPlay?.text = "Stop"
++        curIdx = startIdx
++        playTick()
++    }
++
++    private fun stopPlay() {
++        if (!playing) return
++        playing = false
++        handler.removeCallbacks(playRun)
++        btnPlay?.text = "Putar"
++        canvas.offX = 0
++        canvas.offY = 0
++        canvas.boxW = null
++        canvas.boxH = null
++        load(true)
++    }
++
++    private fun playTick() {
++        if (!playing) return
++        if (!root.isShown) { stopPlay(); return }
++        val fr = seq[curIdx] ?: seq[startIdx]
++        if (fr == null) { stopPlay(); return }
++        val pic = fr.top["pic"]
++        val c = if (pic != null) Sprites.cellFor(sheets, pic) else null
++        canvas.frame = fr
++        canvas.cell = c
++        canvas.bmp = if (c != null) sprites.peek(c.s.file) else null
++        canvas.offX = playAx - (fr.top["centerx"] ?: 0) + ((pxMap[fr.index] ?: 0) - playMinPx)
++        canvas.offY = playAy - (fr.top["centery"] ?: 0)
++        msgTv.text = "▶ ${fr.index} ${fr.caption} · waktu ${fr.top["wait"] ?: 0} · ${speedText()}"
++        canvas.invalidate()
++        val snd = fr.sound
++        if (soundOn && snd != null) playSound(snd)
++        val wait = (fr.top["wait"] ?: 0).coerceIn(0, 999)
++        var ms = ((wait + 1) * 1000f / 30f / speeds[speedI]).toLong().coerceAtLeast(16L)
++        val n = fr.top["next"]
++        if (n == null || n >= 999 || !seq.containsKey(n) || (n == 0 && startIdx != 0)) {
++            curIdx = startIdx
++            ms += 300L // jeda singkat sebelum mengulang
++        } else {
++            curIdx = n
++        }
++        handler.postDelayed(playRun, ms)
++    }
++
++    private fun playSound(path: String) {
++        val fnd = sprites.finder ?: return
++        Thread {
++            try {
++                val bytes = fnd(path) ?: return@Thread
++                val tmp = File(ctx.cacheDir, "snd_" + path.hashCode() + ".wav")
++                if (!tmp.exists()) tmp.writeBytes(bytes)
++                handler.post {
++                    try {
++                        val mp = MediaPlayer()
++                        mp.setDataSource(tmp.absolutePath)
++                        mp.setOnCompletionListener { it.release() }
++                        mp.setOnPreparedListener { it.start() }
++                        mp.prepareAsync()
++                    } catch (ex: Exception) { }
++                }
++            } catch (ex: Exception) { }
++        }.start()
++    }
++}
+diff --git a/app/src/main/java/com/lf2ide/mobile/core/FrameOps.kt b/app/src/main/java/com/lf2ide/mobile/core/FrameOps.kt
+new file mode 100644
+index 0000000..7232643
+--- /dev/null
++++ b/app/src/main/java/com/lf2ide/mobile/core/FrameOps.kt
+@@ -0,0 +1,236 @@
++package com.lf2ide.mobile.core
++
++/** Satu frame di teks .dat: nomor, posisi awal `<frame>`, dan posisi tepat setelah `<frame_end>`. */
++class FrameRange(val idx: Int, val s: Int, val e: Int)
++
++/** Kepala frame untuk daftar/pencarian: nomor, caption, dan posisi `<frame>`. */
++class FrameHead(val idx: Int, val caption: String, val pos: Int)
++
++/** Ringkasan satu frame untuk daftar visual: field utama dan rentang teksnya. */
++class FrameInfo(val idx: Int, val caption: String, val pic: Int?, val wait: Int, val next: Int?, val s: Int, val e: Int)
++
++/** Frame berurutan dengan nama gerakan yang sama (mis. standing 0-3). */
++class FrameGroup(val key: String, val frames: List<FrameInfo>)
++
++/** Satu baris header karakter (name, head, walking_speed, ...) beserta rentang nilainya di teks. */
++class HeadField(val key: String, val value: String, val s: Int, val e: Int)
++
++/**
++ * Operasi teks pada frame (salin frame, salin/tempel move, hapus, cari).
++ * Bekerja langsung pada teks mentah supaya field yang tidak dikenal parser tidak hilang.
++ */
++object FrameOps {
++    const val MAX_INDEX = 998
++
++    private val HDR = Regex("""<frame>\s+(\d+)""")
++    private val HDR_NAME = Regex("""<frame>\s+(\d+)\s+(\S+)""")
++    private val HDR_SUB = Regex("""^<frame>(\s+)\d+""")
++    private val NEXT = Regex("""(?<![A-Za-z_])next:\s*(\d+)""")
++
++    // field yang berisi nomor frame (tujuan lompatan)
++    private val REF1 = Regex(
++        """(?<![A-Za-z_])(next|hit_a|hit_d|hit_j|hit_Fa|hit_Ua|hit_Da|hit_Fj|hit_Uj|hit_Dj|hit_ja|action|fronthurtact|backhurtact|vaction|aaction|jaction|daction|taction|weaponact):(\s*)(\d+)"""
++    )
++    // itr: dua nomor frame per field
++    private val REF2 = Regex("""(?<![A-Za-z_])(catchingact|caughtact):(\s*)(\d+)(\s+)(\d+)""")
++
++    fun ranges(t: String): List<FrameRange> {
++        val out = ArrayList<FrameRange>()
++        for (m in HDR.findAll(t)) {
++            val idx = m.groupValues[1].toIntOrNull() ?: continue
++            val e = t.indexOf("<frame_end>", m.range.first)
++            if (e < 0) continue
++            out.add(FrameRange(idx, m.range.first, e + 11))
++        }
++        return out
++    }
++
++    fun headers(t: String): List<FrameHead> =
++        HDR_NAME.findAll(t).mapNotNull { m ->
++            val idx = m.groupValues[1].toIntOrNull() ?: return@mapNotNull null
++            FrameHead(idx, m.groupValues[2], m.range.first)
++        }.toList()
++
++    fun indexOf(raw: String): Int? = HDR.find(raw)?.groupValues?.get(1)?.toIntOrNull()
++
++    fun nextOf(raw: String): Int? = NEXT.find(raw)?.groupValues?.get(1)?.toIntOrNull()
++
++    /** Nomor kosong pertama >= from (minimal 1) sampai MAX_INDEX, atau null jika habis. */
++    fun freeFrom(used: Set<Int>, from: Int): Int? {
++        var i = maxOf(1, from)
++        while (i <= MAX_INDEX) {
++            if (i !in used) return i
++            i++
++        }
++        return null
++    }
++
++    fun withIndex(raw: String, ni: Int): String =
++        HDR_SUB.replace(raw) { m -> "<frame>" + m.groupValues[1] + ni }
++
++    private fun mp(s: String, m: Map<Int, Int>): String {
++        val n = s.toIntOrNull() ?: return s
++        val r = if (n != 0) m[n] else null
++        return r?.toString() ?: s
++    }
++
++    /** Ganti tujuan lompatan yang menunjuk ke frame dalam peta (nomor 0 = "tidak ada", tidak diubah). */
++    fun remap(raw: String, m: Map<Int, Int>): String {
++        var r = REF2.replace(raw) { g ->
++            g.groupValues[1] + ":" + g.groupValues[2] + mp(g.groupValues[3], m) + g.groupValues[4] + mp(g.groupValues[5], m)
++        }
++        r = REF1.replace(r) { g -> g.groupValues[1] + ":" + g.groupValues[2] + mp(g.groupValues[3], m) }
++        return r
++    }
++
++    /** Frame-frame sebuah move: mulai dari `start`, ikuti `next` sampai 0, >=999, hilang, atau berulang. */
++    fun chain(t: String, start: Int, limit: Int = 64): List<String> {
++        val byIdx = HashMap<Int, FrameRange>()
++        for (r in ranges(t)) if (!byIdx.containsKey(r.idx)) byIdx[r.idx] = r
++        val out = ArrayList<String>()
++        val seen = HashSet<Int>()
++        var i = start
++        while (out.size < limit) {
++            val r = byIdx[i] ?: break
++            if (!seen.add(i)) break
++            val raw = t.substring(r.s, r.e)
++            out.add(raw)
++            val n = nextOf(raw) ?: break
++            if (n == 0 || n >= 999) break
++            i = n
++        }
++        return out
++    }
++
++    /**
++     * Beri nomor baru (mulai dari `from`, hanya nomor yang belum dipakai) untuk sekelompok frame hasil salinan,
++     * lalu arahkan ulang lompatan antar frame di dalam kelompok itu. Null jika nomor kosong tidak cukup.
++     */
++    fun relocate(raws: List<String>, used: Set<Int>, from: Int): List<String>? {
++        val taken = HashSet(used)
++        val map = LinkedHashMap<Int, Int>()
++        val olds = ArrayList<Int>()
++        var next = from
++        for (raw in raws) {
++            val o = indexOf(raw) ?: return null
++            val ni = freeFrom(taken, next) ?: return null
++            olds.add(o)
++            taken.add(ni)
++            map[o] = ni
++            next = ni + 1
++        }
++        return raws.mapIndexed { k, raw -> remap(withIndex(raw, map.getValue(olds[k])), map) }
++    }
++
++    /** Berapa frame lain (selain yang mulai di `exceptPos`) yang `next`-nya menuju `idx`. */
++    fun referrers(t: String, idx: Int, exceptPos: Int): Int {
++        var n = 0
++        for (r in ranges(t)) {
++            if (r.s == exceptPos) continue
++            val v = nextOf(t.substring(r.s, r.e))
++            if (v == idx) n++
++        }
++        return n
++    }
++
++    /** Hapus frame [s, e) beserta sampai dua pemisah baris setelahnya; kembalikan batas akhir yang dihapus. */
++    fun deleteEnd(t: String, e: Int): Int {
++        var j = e
++        var nl = 0
++        while (j < t.length && nl < 2 && (t[j] == '\n' || t[j] == '\r' || t[j] == ' ' || t[j] == '\t')) {
++            if (t[j] == '\n') nl++
++            j++
++        }
++        return j
++    }
++
++    // ---------- ringkasan, kelompok, dan penyuntingan field ----------
++    private val SECT = Regex("""(?<![A-Za-z_])(bpoint|opoint|cpoint|wpoint|itr|bdy):""")
++    private val HDR_CAP = Regex("""^(<frame>\s+\d+\s+)\S+""")
++    private val GKEY = Regex("""[_\-]?\d+$""")
++    private val HEADRE = Regex("""(?m)^[ \t]*([A-Za-z_][A-Za-z_0-9]*):?[ \t]+([^\r\n]*?)[ \t]*$""")
++    private val KEYRE = HashMap<String, Regex>()
++
++    private fun keyRe(k: String): Regex =
++        KEYRE.getOrPut(k) { Regex("(?<![A-Za-z_])" + Regex.escape(k) + ":(\\s*)(\\S+)") }
++
++    /** Batas akhir bagian field utama frame (sebelum seksi bdy/itr/point pertama atau <frame_end>). */
++    private fun topLimit(raw: String): Int {
++        val endTok = raw.lastIndexOf("<frame_end>")
++        val limit = if (endTok >= 0) endTok else raw.length
++        val m = SECT.find(raw)
++        return if (m != null) minOf(limit, m.range.first) else limit
++    }
++
++    fun intIn(raw: String, key: String): Int? =
++        keyRe(key).find(raw.substring(0, topLimit(raw)))?.groupValues?.get(2)?.toIntOrNull()
++
++    fun infos(t: String): List<FrameInfo> {
++        val out = ArrayList<FrameInfo>()
++        for (r in ranges(t)) {
++            val raw = t.substring(r.s, r.e)
++            val cap = HDR_NAME.find(raw)?.groupValues?.get(2) ?: ""
++            out.add(FrameInfo(r.idx, cap, intIn(raw, "pic"), intIn(raw, "wait") ?: 0, intIn(raw, "next"), r.s, r.e))
++        }
++        return out
++    }
++
++    fun groupKey(caption: String): String = caption.lowercase().replace(GKEY, "")
++
++    fun group(list: List<FrameInfo>): List<FrameGroup> {
++        val out = ArrayList<FrameGroup>()
++        var curKey: String? = null
++        var buf = ArrayList<FrameInfo>()
++        for (f in list) {
++            val k = groupKey(f.caption)
++            if (k != curKey) {
++                if (buf.isNotEmpty()) out.add(FrameGroup(curKey ?: "", buf))
++                buf = ArrayList()
++                curKey = k
++            }
++            buf.add(f)
++        }
++        if (buf.isNotEmpty()) out.add(FrameGroup(curKey ?: "", buf))
++        return out
++    }
++
++    /**
++     * Ubah (atau hapus bila value null) satu field angka/teks pada bagian utama frame.
++     * Field yang belum ada ditambahkan tepat setelah baris header frame.
++     */
++    fun setTop(raw: String, key: String, value: String?): String {
++        val cut = topLimit(raw)
++        var head = raw.substring(0, cut)
++        val tail = raw.substring(cut)
++        val m = keyRe(key).find(head)
++        if (m != null) {
++            val g = m.groups[2]!!
++            head = if (value == null) {
++                head.substring(0, m.range.first).trimEnd(' ', '\t') + head.substring(m.range.last + 1)
++            } else {
++                head.substring(0, g.range.first) + value + head.substring(g.range.last + 1)
++            }
++        } else if (value != null) {
++            val nl = head.indexOf('\n')
++            head = if (nl >= 0) head.substring(0, nl) + "\n   " + key + ": " + value + head.substring(nl)
++            else head + "\n   " + key + ": " + value
++        }
++        return head + tail
++    }
++
++    /** Ganti caption pada header `<frame> idx caption`. */
++    fun withCaption(raw: String, caption: String): String =
++        HDR_CAP.replace(raw) { m -> m.groupValues[1] + caption }
++
++    /** Baris `kunci nilai` / `kunci: nilai` di header karakter (sebelum frame pertama); baris file(...) tidak ikut. */
++    fun headFields(t: String): List<HeadField> {
++        val fi = t.indexOf("<frame>")
++        val head = t.substring(0, if (fi < 0) t.length else fi)
++        val out = ArrayList<HeadField>()
++        for (m in HEADRE.findAll(head)) {
++            val v = m.groups[2] ?: continue
++            out.add(HeadField(m.groupValues[1], v.value, v.range.first, v.range.last + 1))
++        }
++        return out
++    }
++}
+diff --git a/app/src/main/java/com/lf2ide/mobile/core/Labels.kt b/app/src/main/java/com/lf2ide/mobile/core/Labels.kt
+new file mode 100644
+index 0000000..d26fc6e
+--- /dev/null
++++ b/app/src/main/java/com/lf2ide/mobile/core/Labels.kt
+@@ -0,0 +1,159 @@
++package com.lf2ide.mobile.core
++
++/** Definisi satu field pada panel: nama kunci di .dat, nama ramah, penjelasan, dan jenisnya. */
++class FieldDef(
++    val key: String,
++    val label: String,
++    val desc: String,
++    val ref: Boolean = false,   // berisi nomor frame tujuan
++    val text: Boolean = false   // teks biasa, bukan angka
++)
++
++class Section(val title: String, val fields: List<FieldDef>)
++
++/** Teks antarmuka (bahasa Indonesia) untuk editor visual. */
++object Labels {
++    private val GROUP: Map<String, String> = mapOf(
++        "standing" to "Berdiri",
++        "walking" to "Berjalan",
++        "running" to "Berlari",
++        "heavy_obj_walk" to "Berjalan bawa benda berat",
++        "heavy_obj_run" to "Berlari bawa benda berat",
++        "heavy_stop_run" to "Berhenti lari bawa benda berat",
++        "normal_weapon_atck" to "Serang pakai senjata",
++        "jump_weapon_atck" to "Serang senjata di udara",
++        "run_weapon_atck" to "Serang senjata sambil lari",
++        "dash_weapon_atck" to "Serang senjata saat dash",
++        "light_weapon_thw" to "Lempar senjata ringan",
++        "heavy_weapon_thw" to "Lempar benda berat",
++        "sky_lgt_wp_thw" to "Lempar senjata di udara",
++        "weapon_drink" to "Minum",
++        "punch" to "Pukulan",
++        "super_punch" to "Pukulan kuat",
++        "jump_attack" to "Serang saat lompat",
++        "run_attack" to "Serang saat lari",
++        "dash_attack" to "Serang saat dash",
++        "dash_defend" to "Tangkis saat dash",
++        "rowing" to "Berguling",
++        "defend" to "Bertahan",
++        "broken_defend" to "Pertahanan pecah",
++        "picking_light" to "Ambil benda ringan",
++        "picking_heavy" to "Ambil benda berat",
++        "catching" to "Menangkap",
++        "picked_caught" to "Tertangkap",
++        "falling" to "Jatuh",
++        "ice" to "Membeku",
++        "fire" to "Terbakar",
++        "tired" to "Kelelahan",
++        "jump" to "Lompat",
++        "dash" to "Dash",
++        "crouch" to "Jongkok",
++        "stop_running" to "Berhenti lari",
++        "injured" to "Terluka",
++        "lying" to "Terbaring",
++        "throw_lying_man" to "Lempar lawan yang terbaring",
++        "dummy" to "Frame kosong",
++        // senjata
++        "in_the_sky" to "Di udara",
++        "on_hand" to "Dipegang",
++        "throwing" to "Dilempar",
++        "on_ground" to "Di tanah",
++        "just_on_ground" to "Baru mendarat",
++        "just_on_on_ground" to "Baru mendarat (2)",
++        // serangan / proyektil
++        "flying" to "Terbang",
++        "hiting" to "Mengenai sasaran",
++        "hit" to "Terkena",
++        "rebounding" to "Memantul",
++        "disappearing" to "Menghilang",
++        "dflying" to "Terbang ke bawah",
++        "uflying" to "Terbang ke atas"
++    )
++
++    fun groupName(key: String): String {
++        if (key.isEmpty()) return "Frame"
++        return GROUP[key] ?: key.replace('_', ' ').replaceFirstChar { it.uppercase() }
++    }
++
++    val STATE: Map<Int, String> = mapOf(
++        0 to "berdiri", 1 to "jalan", 2 to "lari", 3 to "serang", 4 to "lompat", 5 to "dash",
++        6 to "berguling", 7 to "bertahan", 8 to "pertahanan pecah", 9 to "menangkap",
++        10 to "tertangkap", 11 to "terluka", 12 to "jatuh", 13 to "membeku", 14 to "terbaring"
++    )
++
++    private fun f(key: String, label: String, desc: String, ref: Boolean = false, text: Boolean = false) =
++        FieldDef(key, label, desc, ref, text)
++
++    val FRAME_SECTIONS: List<Section> = listOf(
++        Section("FRAME", listOf(
++            f("caption", "Nama", "Nama frame. Hanya label untuk memudahkan, tidak memengaruhi permainan.", text = true),
++            f("state", "Status", "Jenis perilaku frame (0 berdiri, 1 jalan, 2 lari, 3 serang, 4 lompat, 5 dash, 6 berguling, 7 bertahan, dst.).")
++        )),
++        Section("GAMBAR", listOf(
++            f("pic", "Gambar", "Nomor sprite yang ditampilkan dari lembar gambar."),
++            f("centerx", "Tengah x", "Titik poros sprite secara horizontal (di sekitar kaki karakter)."),
++            f("centery", "Tengah y", "Titik poros sprite secara vertikal (biasanya telapak kaki).")
++        )),
++        Section("WAKTU", listOf(
++            f("wait", "Waktu", "Lama frame tampil, dalam tick (30 tick = 1 detik)."),
++            f("next", "Berikutnya", "Frame yang dituju setelah waktu habis. 999 = akhir gerakan, 1000 = objek hilang.", ref = true)
++        )),
++        Section("GERAKAN", listOf(
++            f("dvx", "Gerak x", "Perubahan kecepatan horizontal saat frame ini mulai (550 = tidak diubah)."),
++            f("dvy", "Gerak y", "Perubahan kecepatan vertikal saat frame ini mulai (550 = tidak diubah)."),
++            f("dvz", "Gerak z", "Perubahan kecepatan ke arah kedalaman (550 = tidak diubah).")
++        )),
++        Section("TRANSISI", listOf(
++            f("hit_a", "Setelah A", "Frame tujuan bila tombol serang (A) ditekan.", ref = true),
++            f("hit_d", "Setelah D", "Frame tujuan bila tombol bertahan (D) ditekan.", ref = true),
++            f("hit_j", "Setelah J", "Frame tujuan bila tombol lompat (J) ditekan.", ref = true),
++            f("hit_Fa", "D>A", "Frame tujuan untuk kombo bertahan, maju, lalu serang.", ref = true),
++            f("hit_Ua", "D^A", "Frame tujuan untuk kombo bertahan, atas, lalu serang.", ref = true),
++            f("hit_Da", "DvA", "Frame tujuan untuk kombo bertahan, bawah, lalu serang.", ref = true),
++            f("hit_Fj", "D>J", "Frame tujuan untuk kombo bertahan, maju, lalu lompat.", ref = true),
++            f("hit_Uj", "D^J", "Frame tujuan untuk kombo bertahan, atas, lalu lompat.", ref = true),
++            f("hit_Dj", "DvJ", "Frame tujuan untuk kombo bertahan, bawah, lalu lompat.", ref = true),
++            f("hit_ja", "DJA", "Frame tujuan untuk kombo bertahan, lompat, serang bersamaan.", ref = true)
++        )),
++        Section("LAINNYA", listOf(
++            f("mp", "Mana", "Perubahan MP saat frame ini mulai; nilai negatif memakai MP."),
++            f("sound", "Suara", "Berkas suara yang dimainkan saat frame ini tampil.", text = true)
++        ))
++    )
++
++    private val HEAD: Map<String, String> = mapOf(
++        "name" to "Nama",
++        "head" to "Gambar kepala",
++        "small" to "Gambar kecil",
++        "walking_frame_rate" to "Laju frame jalan",
++        "walking_speed" to "Kecepatan jalan",
++        "walking_speedz" to "Kecepatan jalan (z)",
++        "running_frame_rate" to "Laju frame lari",
++        "running_speed" to "Kecepatan lari",
++        "running_speedz" to "Kecepatan lari (z)",
++        "heavy_walking_speed" to "Kecepatan jalan bawa berat",
++        "heavy_walking_speedz" to "Kecepatan jalan bawa berat (z)",
++        "heavy_running_speed" to "Kecepatan lari bawa berat",
++        "heavy_running_speedz" to "Kecepatan lari bawa berat (z)",
++        "jump_height" to "Tinggi lompat",
++        "jump_distance" to "Jarak lompat",
++        "jump_distancez" to "Jarak lompat (z)",
++        "dash_height" to "Tinggi dash",
++        "dash_distance" to "Jarak dash",
++        "dash_distancez" to "Jarak dash (z)",
++        "rowing_height" to "Tinggi berguling",
++        "rowing_distance" to "Jarak berguling"
++    )
++
++    fun headName(key: String): String = HEAD[key] ?: key
++
++    /** Keterangan di bawah field yang berisi nomor frame tujuan. */
++    fun refHint(key: String, v: Int?, frames: List<FrameInfo>): String {
++        if (v == null) return ""
++        if (v == 999) return "999 = akhir gerakan"
++        if (v == 1000) return "1000 = objek hilang"
++        if (v == 0 && key != "next") return ""
++        val t = frames.firstOrNull { it.idx == v } ?: return "⚠ frame $v tidak ada"
++        return "→ frame $v ${t.caption}"
++    }
++}
+diff --git a/app/src/test/java/com/lf2ide/mobile/FrameOpsTest.kt b/app/src/test/java/com/lf2ide/mobile/FrameOpsTest.kt
+new file mode 100644
+index 0000000..b2470ee
+--- /dev/null
++++ b/app/src/test/java/com/lf2ide/mobile/FrameOpsTest.kt
+@@ -0,0 +1,166 @@
++package com.lf2ide.mobile
++
++import com.lf2ide.mobile.core.FrameOps
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class FrameOpsTest {
++    private fun fr(i: Int, cap: String, next: Int, extra: String = "") =
++        "<frame> $i $cap\n   pic: $i  state: 3  wait: 2  next: $next  centerx: 40  centery: 79\n$extra<frame_end>"
++
++    private val doc = listOf(
++        fr(0, "standing", 0),
++        fr(60, "punch_1", 61, "   itr:\n      kind: 0  x: 1  y: 2  w: 3  h: 4  catchingact: 62 63\n   itr_end:\n"),
++        fr(61, "punch_2", 62, "   opoint:\n      kind: 1  x: 5  y: 6  action: 60  oid: 200\n   opoint_end:\n"),
++        fr(62, "punch_3", 999, "   hit_a: 60  hit_d: 0\n"),
++        fr(70, "other", 999)
++    ).joinToString("\n\n")
++
++    @Test
++    fun rangesAndHeaders() {
++        val r = FrameOps.ranges(doc)
++        assertEquals(listOf(0, 60, 61, 62, 70), r.map { it.idx })
++        assertTrue(doc.substring(r[1].s, r[1].e).startsWith("<frame> 60 punch_1"))
++        assertTrue(doc.substring(r[1].s, r[1].e).endsWith("<frame_end>"))
++        assertEquals("punch_2", FrameOps.headers(doc)[2].caption)
++    }
++
++    @Test
++    fun freeIndex() {
++        assertEquals(1, FrameOps.freeFrom(setOf(0, 60), 0))
++        assertEquals(63, FrameOps.freeFrom(setOf(61, 62), 61))
++        assertNull(FrameOps.freeFrom(setOf(998), 998))
++    }
++
++    @Test
++    fun chainFollowsNextAndStops() {
++        val c = FrameOps.chain(doc, 60)
++        assertEquals(listOf(60, 61, 62), c.map { FrameOps.indexOf(it) })
++        // berakhir di next >= 999; start dari frame yang tidak ada -> kosong
++        assertEquals(0, FrameOps.chain(doc, 5).size)
++        // next: 0 menghentikan rantai (frame 0 tidak ikut)
++        val loop = fr(10, "a", 11) + "\n\n" + fr(11, "b", 0)
++        assertEquals(2, FrameOps.chain(loop, 10).size)
++    }
++
++    @Test
++    fun relocateRenumbersAndRelinks() {
++        val chain = FrameOps.chain(doc, 60)
++        val used = FrameOps.ranges(doc).map { it.idx }.toSet()
++        val out = FrameOps.relocate(chain, used, 63)!!
++        assertEquals(listOf(63, 64, 65), out.map { FrameOps.indexOf(it) })
++        // next antar frame di dalam kelompok diarahkan ulang; 999 tetap
++        assertEquals(64, FrameOps.nextOf(out[0]))
++        assertEquals(65, FrameOps.nextOf(out[1]))
++        assertEquals(999, FrameOps.nextOf(out[2]))
++        // opoint action 60 -> 63, hit_a 60 -> 63, hit_d 0 tetap 0
++        assertTrue(out[1].contains("action: 63"))
++        assertTrue(out[2].contains("hit_a: 63"))
++        assertTrue(out[2].contains("hit_d: 0"))
++        // catchingact 62 63 (62 -> 65; 63 bukan bagian peta lama, tetap 63)
++        assertTrue(out[0].contains("catchingact: 65 63"))
++        // oid bukan nomor frame, tidak berubah
++        assertTrue(out[1].contains("oid: 200"))
++    }
++
++    @Test
++    fun relocateSkipsUsedAndFailsWhenFull() {
++        val a = fr(1, "a", 2)
++        val b = fr(2, "b", 999)
++        val out = FrameOps.relocate(listOf(a, b), setOf(1, 2, 3, 5), 1)!!
++        assertEquals(listOf(4, 6), out.map { FrameOps.indexOf(it) })
++        assertEquals(6, FrameOps.nextOf(out[0]))
++        val full = (1..FrameOps.MAX_INDEX).toSet()
++        assertNull(FrameOps.relocate(listOf(a), full, 1))
++    }
++
++    @Test
++    fun remapDoesNotTouchSimilarKeys() {
++        val raw = "<frame> 1 x\n   next: 2  weaponact: 2  aaction: 2  fronthurtact: 2  oid: 2  dvx: 2\n<frame_end>"
++        val out = FrameOps.remap(raw, mapOf(2 to 9))
++        assertTrue(out.contains("next: 9"))
++        assertTrue(out.contains("weaponact: 9"))
++        assertTrue(out.contains("aaction: 9"))
++        assertTrue(out.contains("fronthurtact: 9"))
++        assertTrue(out.contains("oid: 2"))
++        assertTrue(out.contains("dvx: 2"))
++    }
++
++    @Test
++    fun copyFrameHeaderOnly() {
++        val raw = fr(61, "punch_2", 62, "   unknown_field: 7\n")
++        val c = FrameOps.withIndex(raw, 80)
++        assertTrue(c.startsWith("<frame> 80 punch_2"))
++        assertTrue(c.contains("unknown_field: 7")) // field tak dikenal tetap ada
++        assertEquals(61, FrameOps.indexOf(raw))
++    }
++
++    @Test
++    fun referrersAndDelete() {
++        assertEquals(1, FrameOps.referrers(doc, 62, FrameOps.ranges(doc)[3].s)) // 61 -> 62
++        assertEquals(0, FrameOps.referrers(doc, 70, -1))
++        val r = FrameOps.ranges(doc)[1]
++        val end = FrameOps.deleteEnd(doc, r.e)
++        val after = doc.substring(0, r.s) + doc.substring(end)
++        assertNotNull(FrameOps.ranges(after).firstOrNull { it.idx == 61 })
++        assertEquals(listOf(0, 61, 62, 70), FrameOps.ranges(after).map { it.idx })
++    }
++
++    // ---------- editor visual ----------
++    private val head = "<bmp_begin>\nname: Davis\nhead: sprite\\sys\\davis_f.bmp\nfile(0-69): sprite\\sys\\davis_0.bmp  w: 79  h: 79  row: 10  col: 7\nwalking_speed 4.000000\n<bmp_end>\n\n"
++    private val vdoc = head + listOf(
++        fr(0, "standing", 1), fr(1, "standing", 2), fr(2, "standing", 0),
++        "<frame> 5 walking_1\n   pic: 5  state: 1  wait: 3  next: 6  dvx: 4\n   bdy:\n      kind: 0  x: 1  y: 2  w: 3  h: 4\n   bdy_end:\n<frame_end>",
++        "<frame> 6 walking_2\n   pic: 6  state: 1  wait: 3  next: 5\n<frame_end>"
++    ).joinToString("\n\n")
++
++    @Test
++    fun infosAndGroups() {
++        val inf = FrameOps.infos(vdoc)
++        assertEquals(listOf(0, 1, 2, 5, 6), inf.map { it.idx })
++        assertEquals(5, inf[3].pic)
++        assertEquals(3, inf[3].wait)
++        assertEquals(6, inf[3].next)
++        assertEquals("walking_1", inf[3].caption)
++        val g = FrameOps.group(inf)
++        assertEquals(listOf("standing", "walking"), g.map { it.key })
++        assertEquals(listOf(3, 2), g.map { it.frames.size })
++    }
++
++    @Test
++    fun setTopEditsInsertsAndRemoves() {
++        val raw = "<frame> 5 walking_1\n   pic: 5  state: 1  wait: 3  next: 6\n   bdy:\n      kind: 0  x: 1  y: 2  w: 3  h: 4\n   bdy_end:\n<frame_end>"
++        val a = FrameOps.setTop(raw, "wait", "9")
++        assertTrue(a.contains("wait: 9"))
++        assertTrue(a.contains("w: 3")) // w di dalam bdy tidak tersentuh
++        val b = FrameOps.setTop(raw, "dvx", "4")
++        assertTrue(b.startsWith("<frame> 5 walking_1\n   dvx: 4\n"))
++        val c = FrameOps.setTop(raw, "state", null)
++        assertTrue(!c.contains("state"))
++        assertTrue(c.contains("pic: 5") && c.contains("wait: 3"))
++        // field di dalam seksi tidak ikut terbaca sebagai field utama
++        assertNull(FrameOps.intIn(raw, "kind"))
++        // frame tanpa seksi apa pun
++        val d = FrameOps.setTop("<frame> 6 x\n   pic: 6\n<frame_end>", "next", "7")
++        assertTrue(d.contains("next: 7") && d.endsWith("<frame_end>"))
++        // teks (sound)
++        val e = FrameOps.setTop(raw, "sound", "data\\001.wav")
++        assertEquals("data\\001.wav", Regex("sound: (\\S+)").find(e)!!.groupValues[1])
++    }
++
++    @Test
++    fun captionAndHeader() {
++        assertTrue(FrameOps.withCaption("<frame> 5 walking_1\n   pic: 5\n<frame_end>", "jalan").startsWith("<frame> 5 jalan\n"))
++        val hf = FrameOps.headFields(vdoc)
++        assertEquals(listOf("name", "head", "walking_speed"), hf.map { it.key })
++        assertEquals("Davis", hf[0].value)
++        assertEquals("4.000000", hf[2].value)
++        val f = hf[0]
++        val t2 = vdoc.substring(0, f.s) + "Zero" + vdoc.substring(f.e)
++        assertEquals("Zero", FrameOps.headFields(t2)[0].value)
++    }
++}
++
