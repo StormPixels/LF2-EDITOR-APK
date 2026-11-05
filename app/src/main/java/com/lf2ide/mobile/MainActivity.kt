@@ -83,6 +83,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var design: DesignPanel
     private lateinit var visual: VisualEditor
     private lateinit var browser: ProjectBrowser
+    private lateinit var versions: VersionStore
     private var project: List<DataEntry> = emptyList()
     @Volatile private var scanGen = 0
     private lateinit var keysScroll: HorizontalScrollView
@@ -170,7 +171,8 @@ class MainActivity : AppCompatActivity() {
         }
         sprites = SpriteStore(this)
         design = DesignPanel(this, sprites, editor) { pickSprites.launch(arrayOf("image/*")) }
-        visual = VisualEditor(this, sprites, editor, { pickSprites.launch(arrayOf("image/*")) }, { treeLauncher.launch(null) })
+        versions = VersionStore(java.io.File(filesDir, "history"))
+        visual = VisualEditor(this, sprites, editor, { pickSprites.launch(arrayOf("image/*")) }, { treeLauncher.launch(null) }, versions)
         browser = ProjectBrowser(this) { e -> openEntry(e) }
         win = DesignWindow(this, design.root)
         win.onChanged = { layoutWindow() }
@@ -598,6 +600,7 @@ class MainActivity : AppCompatActivity() {
         editor.setSelection(0)
         loading = false
         docUri = uri; docName = name; encrypted = enc; dirty = false; info = ""
+        visual.onDocLoaded(if (uri != null) name + "|" + uri.toString() else null, text)
         hl = Highlighter(langFor(name, text))
         hlA = -1; hlB = -1
         editor.scrollTo(0, 0)
@@ -636,6 +639,7 @@ class MainActivity : AppCompatActivity() {
             dirty = false
             updateStatus()
             toast("Tersimpan: $docName")
+            visual.onSaved(docName + "|" + uri.toString())
             true
         } catch (e: Exception) {
             toast("Gagal menyimpan: ${e.message}")

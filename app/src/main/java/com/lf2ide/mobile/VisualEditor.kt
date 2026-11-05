@@ -23,10 +23,13 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.core.widget.doAfterTextChanged
 import com.lf2ide.mobile.core.Cell
+import com.lf2ide.mobile.core.Change
+import com.lf2ide.mobile.core.Diff
 import com.lf2ide.mobile.core.FieldDef
 import com.lf2ide.mobile.core.Frame
 import com.lf2ide.mobile.core.FrameGroup
@@ -36,12 +39,17 @@ import com.lf2ide.mobile.core.FrameParser
 import com.lf2ide.mobile.core.FrameWriter
 import com.lf2ide.mobile.core.HeadField
 import com.lf2ide.mobile.core.Labels
+import com.lf2ide.mobile.core.Problem
 import com.lf2ide.mobile.core.Schema
 import com.lf2ide.mobile.core.Sect
 import com.lf2ide.mobile.core.Sheet
 import com.lf2ide.mobile.core.Sprites
 import com.lf2ide.mobile.core.Tokenizer
+import com.lf2ide.mobile.core.Validator
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 private const val V_BG = 0xFF0B1220.toInt()
 private const val V_PANEL = 0xFF111B2E.toInt()
@@ -86,7 +94,8 @@ class VisualEditor(
     private val sprites: SpriteStore,
     private val ed: EditText,
     private val pickSprite: () -> Unit,
-    private val openFolder: () -> Unit
+    private val openFolder: () -> Unit,
+    private val versions: VersionStore
 ) {
     val root = LinearLayout(ctx)
     var folderSet = false
@@ -94,6 +103,21 @@ class VisualEditor(
     private val handler = Handler(Looper.getMainLooper())
     private val loadRun = Runnable { load(true) }
     private val thumbRun = Runnable { listAdapter.notifyDataSetChanged(); rebuildStrip() }
+    private val statRun = Runnable { recompute() }
+
+    // versi asli dan riwayat
+    private var original = ""
+    private var docKey: String? = null
+    private var problems: List<Problem> = emptyList()
+    private var changes: List<Change> = emptyList()
+    private var headChanges: List<String> = emptyList()
+    private var btnChanges: Button? = null
+    private var btnProblems: Button? = null
+
+    // boneka
+    private var dummyOn = false
+    private val dummyBox = LinearLayout(ctx)
+    private val dummyTv = TextView(ctx)
 
     // data
     private var infos: List<FrameInfo> = emptyList()
@@ -256,6 +280,15 @@ class VisualEditor(
         acts.addView(sbtn("Salin move") { actions.copyMove(cur) }, lp(0, WRAP, 1.4f))
         acts.addView(sbtn("Tempel") { actions.pasteMove(cur) }, lp(0, WRAP, 1f))
         listPanel.addView(acts, lp(MATCH, WRAP))
+        val stat = LinearLayout(ctx)
+        val bc = sbtn("Perubahan 0") { showChanges() }
+        btnChanges = bc
+        stat.addView(bc, lp(0, WRAP, 1.3f))
+        val bpr = sbtn("Masalah 0") { showProblems() }
+        btnProblems = bpr
+        stat.addView(bpr, lp(0, WRAP, 1f))
+        stat.addView(sbtn("Riwayat") { showHistory() }, lp(0, WRAP, 1f))
+        listPanel.addView(stat, lp(MATCH, WRAP))
         list.adapter = listAdapter
         list.divider = null
         list.setOnItemClickListener { _, _, pos, _ -> onRowClick(pos) }
@@ -280,6 +313,12 @@ class VisualEditor(
         add("titik", true, V_POINTS)
         add("sebelumnya", false, listOf("prev"))
         add("cermin", false, listOf("mirror"))
+        chips.addView(chip("boneka", false) { v ->
+            dummyOn = v
+            dummyBox.visibility = if (v) View.VISIBLE else View.GONE
+            updateDummy()
+            canvas.invalidate()
+        }, lp(WRAP, WRAP).apply { setMargins(dp(2), 0, dp(2), 0) })
         val z = sbtn("Zoom 1×") {
             val n = if (canvas.zoom >= 4f) 1f else canvas.zoom + 1f
             canvas.zoom = n
@@ -316,6 +355,31 @@ class VisualEditor(
         msgTv.setTextColor(V_DIM)
         msgTv.setPadding(dp(8), dp(2), dp(8), dp(2))
         centerPanel.addView(msgTv, lp(MATCH, WRAP))
+
+        dummyBox.orientation = LinearLayout.VERTICAL
+        dummyBox.setPadding(dp(8), dp(2), dp(8), dp(4))
+        dummyBox.visibility = View.GONE
+        val drow = LinearLayout(ctx)
+        drow.gravity = Gravity.CENTER_VERTICAL
+        drow.addView(tv("jarak", 12f, V_DIM), lp(WRAP, WRAP))
+        val sb = SeekBar(ctx)
+        sb.max = 240
+        sb.progress = canvas.dummyDx + 40
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                canvas.dummyDx = progress - 40
+                updateDummy()
+                canvas.invalidate()
+            }
+            override fun onStartTrackingTouch(bar: SeekBar?) {}
+            override fun onStopTrackingTouch(bar: SeekBar?) {}
+        })
+        drow.addView(sb, lp(0, WRAP, 1f))
+        dummyBox.addView(drow)
+        dummyTv.textSize = 12f
+        dummyTv.setTextColor(V_ACC)
+        dummyBox.addView(dummyTv)
+        centerPanel.addView(dummyBox, lp(MATCH, WRAP))
     }
 
     private fun buildRight() {
@@ -425,6 +489,7 @@ class VisualEditor(
         if (fr?.obj(canvas.sel) == null) canvas.sel = null
         loadGhost(c0, fr, t)
         canvas.requestLayout()
+        updateDummy()
         canvas.invalidate()
         msgTv.text = if (c0 == null) "Tidak ada frame — gunakan mode Kode untuk menambah"
         else "Frame ${c0.idx} · ${c0.caption} · ${Labels.groupName(FrameOps.groupKey(c0.caption))}"
@@ -443,6 +508,8 @@ class VisualEditor(
         }
         rebuildStrip()
         if (rebuildForm) buildTab() else updateHints()
+        handler.removeCallbacks(statRun)
+        handler.postDelayed(statRun, 400)
     }
 
     private fun loadGhost(c0: FrameInfo?, fr: Frame?, t: String) {
@@ -1028,6 +1095,7 @@ class VisualEditor(
         canvas.bmp = if (c != null) sprites.peek(c.s.file) else null
         canvas.offX = playAx - (fr.top["centerx"] ?: 0) + ((pxMap[fr.index] ?: 0) - playMinPx)
         canvas.offY = playAy - (fr.top["centery"] ?: 0)
+        if (dummyOn) updateDummy()
         msgTv.text = "▶ ${fr.index} ${fr.caption} · waktu ${fr.top["wait"] ?: 0} · ${speedText()}"
         canvas.invalidate()
         val snd = fr.sound
@@ -1042,6 +1110,206 @@ class VisualEditor(
             curIdx = n
         }
         handler.postDelayed(playRun, ms)
+    }
+
+    // ---------- boneka ----------
+    /** Uji kotak serangan (itr) frame yang tampil terhadap kotak tubuh boneka. */
+    private fun updateDummy() {
+        canvas.dummyOn = dummyOn
+        if (!dummyOn) {
+            canvas.hitItr = emptySet()
+            dummyTv.text = ""
+            return
+        }
+        val f = canvas.frame
+        if (f == null) {
+            canvas.hitItr = emptySet()
+            dummyTv.text = ""
+            return
+        }
+        val cx = f.top["centerx"] ?: ((canvas.cell?.s?.w ?: 0) / 2)
+        val cy = f.top["centery"] ?: (canvas.cell?.s?.h ?: 0)
+        val dl = cx + canvas.dummyDx - canvas.dummyW / 2
+        val dr = dl + canvas.dummyW
+        val dt = cy - canvas.dummyH
+        val db = cy
+        val hits = HashSet<Int>()
+        var gap = Int.MAX_VALUE
+        var firstHit = ""
+        for ((i, o) in f.itrs.withIndex()) {
+            val x = o.v["x"] ?: continue
+            val y = o.v["y"] ?: continue
+            val w = o.v["w"] ?: continue
+            val h = o.v["h"] ?: continue
+            val vOverlap = y < db && y + h > dt
+            if (vOverlap && x < dr && x + w > dl) {
+                if (hits.isEmpty()) firstHit = "serangan #${i + 1} (kind ${o.v["kind"] ?: 0}, injury ${o.v["injury"] ?: 0})"
+                hits.add(i)
+            } else if (vOverlap) {
+                val g = if (x + w <= dl) dl - (x + w) else x - dr
+                if (g < gap) gap = g
+            }
+        }
+        canvas.hitItr = hits
+        dummyTv.text = when {
+            hits.isNotEmpty() -> "Kena: $firstHit" + if (hits.size > 1) " +${hits.size - 1} lagi" else ""
+            f.itrs.isEmpty() -> "Frame ini tidak punya kotak serangan"
+            gap != Int.MAX_VALUE -> "Tidak kena · celah ${gap} px (jarak ${canvas.dummyDx})"
+            else -> "Kotak serangan di luar tinggi boneka"
+        }
+    }
+
+    // ---------- statistik: perubahan dan masalah ----------
+    private fun recompute() {
+        val t = ed.text.toString()
+        problems = Validator.check(t, sheets.map { it.start..it.end })
+        if (original.isNotEmpty()) {
+            changes = Diff.frames(original, t)
+            headChanges = Diff.headerChanges(original, t)
+        } else {
+            changes = emptyList()
+            headChanges = emptyList()
+        }
+        btnChanges?.text = "Perubahan " + (changes.size + headChanges.size)
+        val errs = problems.count { it.level == 0 }
+        btnProblems?.text = "Masalah " + problems.size
+        btnProblems?.setTextColor(if (errs > 0) 0xFFF87171.toInt() else if (problems.isNotEmpty()) 0xFFF59E0B.toInt() else V_FG)
+    }
+
+    /** Dipanggil saat sebuah file dibuka: menentukan versi asli (disimpan sejak pertama kali dibuka). */
+    fun onDocLoaded(key: String?, text: String) {
+        docKey = key
+        if (key != null) {
+            versions.saveOriginal(key, text)
+            original = versions.original(key) ?: text
+        } else {
+            original = text
+        }
+        handler.removeCallbacks(statRun)
+        handler.postDelayed(statRun, 400)
+    }
+
+    /** Dipanggil setelah file berhasil disimpan: catat salinan di riwayat. */
+    fun onSaved(key: String) {
+        docKey = key
+        versions.saveOriginal(key, original)
+        versions.add(key, ed.text.toString())
+    }
+
+    private fun replaceAll(text: String) {
+        ed.text.replace(0, ed.text.length, text)
+        ed.setSelection(0)
+        follow()
+    }
+
+    private fun showProblems() {
+        if (problems.isEmpty()) {
+            android.widget.Toast.makeText(ctx, "Tidak ada masalah ditemukan", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val items = problems.map { (if (it.level == 0) "✖ " else "⚠ ") + it.text }
+        AlertDialog.Builder(ctx)
+            .setTitle("Masalah · ${problems.size}")
+            .setItems(items.toTypedArray()) { _, i ->
+                val p = problems[i]
+                if (p.idx != null) gotoOffset(p.pos + 8)
+            }
+            .setNegativeButton("Tutup", null)
+            .show()
+    }
+
+    private fun showChanges() {
+        val total = changes.size + headChanges.size
+        if (total == 0) {
+            android.widget.Toast.makeText(ctx, "Belum ada perubahan dari versi asli", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val items = ArrayList<String>()
+        for (h in headChanges) items.add("header · $h")
+        for (c in changes) {
+            val shown = c.lines.take(6).joinToString("\n") { "   $it" }
+            val more = if (c.lines.size > 6) "\n   … +${c.lines.size - 6} lagi" else ""
+            items.add("${c.kind} ${c.idx} ${c.caption}\n$shown$more")
+        }
+        AlertDialog.Builder(ctx)
+            .setTitle("Perubahan · $total")
+            .setItems(items.toTypedArray()) { _, i ->
+                if (i < headChanges.size) {
+                    tab = 3
+                    paintTabs()
+                    buildTab()
+                } else {
+                    changeActions(changes[i - headChanges.size])
+                }
+            }
+            .setNeutralButton("Pulihkan semua") { _, _ ->
+                AlertDialog.Builder(ctx)
+                    .setMessage("Kembalikan seluruh file ke versi asli? (bisa di-undo)")
+                    .setPositiveButton("Pulihkan") { _, _ -> replaceAll(original) }
+                    .setNegativeButton("Batal", null)
+                    .show()
+            }
+            .setNegativeButton("Tutup", null)
+            .show()
+    }
+
+    private fun changeActions(c: Change) {
+        val acts = ArrayList<String>()
+        if (c.kind != '-') acts.add("Lompat ke frame ${c.idx}")
+        acts.add(if (c.kind == '+') "Hapus frame baru ini" else if (c.kind == '-') "Kembalikan frame yang dihapus" else "Pulihkan frame ke versi asli")
+        AlertDialog.Builder(ctx)
+            .setTitle("Frame ${c.idx} ${c.caption}")
+            .setItems(acts.toTypedArray()) { _, i ->
+                val jump = c.kind != '-'
+                if (jump && i == 0) {
+                    gotoOffset(c.pos + 8)
+                } else {
+                    val e = Diff.restore(ed.text.toString(), original, c)
+                    if (e != null) {
+                        ed.text.replace(e.s, e.e, e.text)
+                        follow()
+                    }
+                }
+            }
+            .setNegativeButton("Batal", null)
+            .show()
+    }
+
+    private fun showHistory() {
+        val key = docKey
+        if (key == null) {
+            android.widget.Toast.makeText(ctx, "Riwayat tersedia untuk file yang dibuka dari folder", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val saved = versions.list(key)
+        val fmt = SimpleDateFormat("dd MMM HH:mm:ss", Locale("id"))
+        val items = ArrayList<String>()
+        items.add("Asli (saat pertama dibuka)")
+        for ((ts, _) in saved) items.add("Tersimpan " + fmt.format(Date(ts)))
+        items.add("Jadikan isi sekarang sebagai versi asli")
+        AlertDialog.Builder(ctx)
+            .setTitle("Riwayat versi")
+            .setItems(items.toTypedArray()) { _, i ->
+                when {
+                    i == items.size - 1 -> {
+                        versions.setOriginal(key, ed.text.toString())
+                        original = ed.text.toString()
+                        recompute()
+                    }
+                    else -> {
+                        val text = if (i == 0) versions.original(key) else versions.read(saved[i - 1].second)
+                        if (text != null) {
+                            AlertDialog.Builder(ctx)
+                                .setMessage("Pulihkan isi file ke versi ini? Perubahan sekarang diganti (bisa di-undo).")
+                                .setPositiveButton("Pulihkan") { _, _ -> replaceAll(text) }
+                                .setNegativeButton("Batal", null)
+                                .show()
+                        }
+                    }
+                }
+            }
+            .setNegativeButton("Tutup", null)
+            .show()
     }
 
     private fun playSound(path: String) {

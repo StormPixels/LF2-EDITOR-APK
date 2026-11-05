@@ -85,6 +85,13 @@ class DesignCanvas(ctx: Context) : View(ctx) {
     var zoom = 1f
     var panOnEmpty = false
 
+    // boneka untuk mengukur jarak dan hasil hit (kotak tubuh tetap, di depan karakter)
+    var dummyOn = false
+    var dummyDx = 60
+    var dummyW = 40
+    var dummyH = 80
+    var hitItr: Set<Int> = emptySet()
+
     // pratinjau animasi: kotak tetap + geser sprite agar titik center sejajar
     var boxW: Int? = null
     var boxH: Int? = null
@@ -172,9 +179,25 @@ class DesignCanvas(ctx: Context) : View(ctx) {
                 fill.color = (base and 0xFFFFFF) or 0x44000000
                 stroke.color = if (on) 0xFFFFFFFF.toInt() else base
                 stroke.strokeWidth = if (on) 5f else 2f
+                if (t == "itr" && dummyOn && hitItr.contains(i)) {
+                    fill.color = 0x88FFE600.toInt()
+                    stroke.color = 0xFFFFE600.toInt()
+                    stroke.strokeWidth = 4f
+                }
                 c.drawRect(x * s, y * s, (x + w) * s, (y + h) * s, fill)
                 c.drawRect(x * s, y * s, (x + w) * s, (y + h) * s, stroke)
             }
+        }
+        if (dummyOn) {
+            val dcx = f.top["centerx"] ?: ((cell?.s?.w ?: 0) / 2)
+            val dcy = f.top["centery"] ?: (cell?.s?.h ?: 0)
+            val l = dcx + dummyDx - dummyW / 2f
+            val tp = (dcy - dummyH).toFloat()
+            fill.color = 0x3300FF99
+            stroke.color = 0xFF00FF99.toInt()
+            stroke.strokeWidth = 2f
+            c.drawRect(l * s, tp * s, (l + dummyW) * s, (tp + dummyH) * s, fill)
+            c.drawRect(l * s, tp * s, (l + dummyW) * s, (tp + dummyH) * s, stroke)
         }
         for (t in POINTS) {
             if (vis[t] == false) continue

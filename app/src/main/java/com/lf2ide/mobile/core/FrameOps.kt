@@ -162,6 +162,20 @@ object FrameOps {
         return if (m != null) minOf(limit, m.range.first) else limit
     }
 
+    /** Bagian field utama frame (header dan field sebelum seksi bdy/itr/point pertama). */
+    fun topPart(raw: String): String = raw.substring(0, topLimit(raw))
+
+    /** Semua (kunci, nomor frame) tujuan lompatan di sebuah frame: next, hit_*, action, dst. */
+    fun refs(raw: String): List<Pair<String, Int>> {
+        val out = ArrayList<Pair<String, Int>>()
+        for (m in REF2.findAll(raw)) {
+            m.groupValues[3].toIntOrNull()?.let { out.add(m.groupValues[1] to it) }
+            m.groupValues[5].toIntOrNull()?.let { out.add(m.groupValues[1] to it) }
+        }
+        for (m in REF1.findAll(raw)) m.groupValues[3].toIntOrNull()?.let { out.add(m.groupValues[1] to it) }
+        return out
+    }
+
     fun intIn(raw: String, key: String): Int? =
         keyRe(key).find(raw.substring(0, topLimit(raw)))?.groupValues?.get(2)?.toIntOrNull()
 
