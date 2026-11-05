@@ -1,0 +1,729 @@
+diff --git a/app/src/main/java/com/lf2ide/mobile/DesignPanel.kt b/app/src/main/java/com/lf2ide/mobile/DesignPanel.kt
+index 6545bc8..2e93978 100644
+--- a/app/src/main/java/com/lf2ide/mobile/DesignPanel.kt
++++ b/app/src/main/java/com/lf2ide/mobile/DesignPanel.kt
+@@ -1,5 +1,7 @@
+ package com.lf2ide.mobile
+ 
++import android.content.ClipData
++import android.content.ClipboardManager
+ import android.content.Context
+ import android.graphics.Bitmap
+ import android.graphics.BitmapShader
+@@ -15,21 +17,29 @@ import android.view.MotionEvent
+ import android.view.View
+ import android.view.ViewGroup
+ import android.view.inputmethod.EditorInfo
++import android.widget.ArrayAdapter
+ import android.widget.Button
+ import android.widget.CheckBox
+ import android.widget.EditText
+ import android.widget.HorizontalScrollView
+ import android.widget.LinearLayout
++import android.widget.ListView
+ import android.widget.ScrollView
+ import android.widget.TextView
++import android.widget.Toast
++import androidx.appcompat.app.AlertDialog
++import androidx.core.widget.doAfterTextChanged
+ import com.lf2ide.mobile.core.Cell
+ import com.lf2ide.mobile.core.Frame
++import com.lf2ide.mobile.core.FrameHead
++import com.lf2ide.mobile.core.FrameOps
+ import com.lf2ide.mobile.core.FrameParser
+ import com.lf2ide.mobile.core.FrameWriter
+ import com.lf2ide.mobile.core.Schema
+ import com.lf2ide.mobile.core.Sect
+ import com.lf2ide.mobile.core.Sheet
+ import com.lf2ide.mobile.core.Sprites
++import com.lf2ide.mobile.core.Tokenizer
+ import kotlin.math.hypot
+ import kotlin.math.roundToInt
+ 
+@@ -67,9 +77,23 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+     var onSelect: (() -> Unit)? = null
+     var onMoved: (() -> Unit)? = null
+     var onDone: (() -> Unit)? = null
+-
+-    private val ww: Int get() = maxOf(120, (cell?.s?.w ?: 0) + 10)
+-    private val wh: Int get() = maxOf(110, (cell?.s?.h ?: 0) + 10)
++    var onTouchStart: (() -> Boolean)? = null // true = sentuhan dipakai (mis. menghentikan putaran), jangan pilih apa pun
++
++    // pratinjau animasi: kotak tetap + geser sprite agar titik center sejajar
++    var boxW: Int? = null
++    var boxH: Int? = null
++    var offX = 0
++    var offY = 0
++
++    // onion skin (frame sebelumnya)
++    var ghost: Bitmap? = null
++    var ghostCell: Cell? = null
++    var ghostDx = 0
++    var ghostDy = 0
++    private val ghostPaint = Paint().apply { isFilterBitmap = false; alpha = 90 }
++
++    private val ww: Int get() = boxW ?: maxOf(120, (cell?.s?.w ?: 0) + 10)
++    private val wh: Int get() = boxH ?: maxOf(110, (cell?.s?.h ?: 0) + 10)
+     private val bg = Paint()
+     private val bp = Paint().apply { isFilterBitmap = false }
+     private val fill = Paint().apply { style = Paint.Style.FILL }
+@@ -100,6 +124,17 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+         val s = width / ww.toFloat()
+         c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bg)
+         val f = frame ?: return
++        c.save()
++        if (vis["mirror"] == true) c.scale(-1f, 1f, width / 2f, 0f)
++        c.translate(offX * s, offY * s)
++        val gb = ghost
++        val gc = ghostCell
++        if (vis["prev"] == true && gb != null && gc != null) {
++            c.drawBitmap(
++                gb, Rect(gc.sx, gc.sy, gc.sx + gc.s.w, gc.sy + gc.s.h),
++                RectF(ghostDx * s, ghostDy * s, (ghostDx + gc.s.w) * s, (ghostDy + gc.s.h) * s), ghostPaint
++            )
++        }
+         val b = bmp
+         val ce = cell
+         if (b != null && ce != null) {
+@@ -109,8 +144,8 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+             val cx = f.top["centerx"]
+             val cy = f.top["centery"]
+             if (cx != null && cy != null) {
+-                c.drawLine(cx * s, 0f, cx * s, height.toFloat(), line)
+-                c.drawLine(0f, cy * s, width.toFloat(), cy * s, line)
++                c.drawLine(cx * s, -offY * s, cx * s, height - offY * s, line)
++                c.drawLine(-offX * s, cy * s, width - offX * s, cy * s, line)
+             }
+         }
+         for (t in listOf("bdy", "itr")) {
+@@ -138,6 +173,7 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+             fill.color = COL[t]!!
+             c.drawCircle(x * s, y * s, if (sel?.type == t) 7f * s / 2f else 4f * s / 2f, fill)
+         }
++        c.restore()
+     }
+ 
+     private fun hit(f: Frame, x: Float, y: Float): Sel? {
+@@ -166,11 +202,13 @@ class DesignCanvas(ctx: Context) : View(ctx) {
+     override fun onTouchEvent(e: MotionEvent): Boolean {
+         val f = frame ?: return false
+         val s = width / ww.toFloat()
+-        val x = e.x / s
+-        val y = e.y / s
++        val vx = if (vis["mirror"] == true) width - e.x else e.x
++        val x = vx / s - offX
++        val y = e.y / s - offY
+         when (e.actionMasked) {
+             MotionEvent.ACTION_DOWN -> {
+                 parent?.requestDisallowInterceptTouchEvent(true)
++                if (onTouchStart?.invoke() == true) return true
+                 sel = hit(f, x, y)
+                 onSelect?.invoke()
+                 val o = f.obj(sel)
+@@ -225,13 +263,27 @@ class DesignPanel(
+     private var applying = false
+     var folderSet = false
+ 
++    // pratinjau animasi
++    private var playing = false
++    private val speeds = floatArrayOf(0.25f, 0.5f, 1f, 2f)
++    private var speedI = 2
++    private var seq: Map<Int, Frame> = emptyMap()
++    private var startIdx = 0
++    private var curIdx = 0
++    private var playAx = 0
++    private var playAy = 0
++    private val playRun = Runnable { playTick() }
++    private var btnPlay: Button? = null
++    private var btnSpeed: Button? = null
++
+     fun follow() {
+         if (applying || !root.isShown) return
++        if (playing) { stopPlay(); return }
+         handler.removeCallbacks(run)
+         handler.postDelayed(run, 120)
+     }
+ 
+-    fun refresh() { if (root.isShown) load() }
++    fun refresh() { if (root.isShown && !playing) load() }
+ 
+     private fun load() {
+         val t = ed.text.toString()
+@@ -258,6 +310,7 @@ class DesignPanel(
+         canvas.frame = fr
+         canvas.cell = c
+         canvas.bmp = if (c != null) sprites.peek(c.s.file) else null
++        loadGhost(t, fr)
+         if (fr?.obj(canvas.sel) == null) canvas.sel = null
+         idx.setText(fr?.index?.toString() ?: "")
+         cap.setText(fr?.caption ?: "")
+@@ -377,7 +430,11 @@ class DesignPanel(
+ 
+     private fun gotoFrame(n: Int) {
+         val m = Regex("<frame>\\s+$n\\s").find(ed.text) ?: return
+-        val off = m.range.first + 8
++        gotoOffset(m.range.first + 8)
++    }
++
++    private fun gotoOffset(off0: Int) {
++        val off = off0.coerceIn(0, ed.text.length)
+         ed.setSelection(off)
+         ed.post {
+             val lay = ed.layout
+@@ -385,6 +442,240 @@ class DesignPanel(
+         }
+     }
+ 
++    private fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_SHORT).show()
++
++    // ---------- onion skin ----------
++    private fun loadGhost(t: String, fr: Frame?) {
++        canvas.ghost = null
++        canvas.ghostCell = null
++        if (canvas.vis["prev"] != true || fr == null || rs <= 0) return
++        val ps = t.lastIndexOf("<frame>", rs - 1)
++        if (ps < 0) return
++        val pe = t.indexOf("<frame_end>", ps)
++        if (pe < 0 || pe >= rs) return
++        val pf = try { FrameParser.read(t.substring(ps, pe + 11)) } catch (ex: Exception) { null } ?: return
++        val pp = pf.top["pic"] ?: return
++        val pc = Sprites.cellFor(sheets, pp) ?: return
++        if (!sprites.has(pc.s.file)) sprites.request(pc.s.file) { refresh() }
++        canvas.ghost = sprites.peek(pc.s.file)
++        canvas.ghostCell = pc
++        canvas.ghostDx = (fr.top["centerx"] ?: 0) - (pf.top["centerx"] ?: 0)
++        canvas.ghostDy = (fr.top["centery"] ?: 0) - (pf.top["centery"] ?: 0)
++    }
++
++    // ---------- pratinjau animasi ----------
++    private fun speedText() = "${speeds[speedI]}×".replace(".0×", "×")
++
++    private fun togglePlay() { if (playing) stopPlay() else startPlay() }
++
++    private fun startPlay() {
++        val f = frame
++        if (f == null) { toast("Letakkan kursor di dalam sebuah frame"); return }
++        val m = LinkedHashMap<Int, Frame>()
++        for (raw in Tokenizer.getFrames(ed.text.toString())) {
++            val fr = try { FrameParser.read(raw) } catch (ex: Exception) { null } ?: continue
++            if (!m.containsKey(fr.index)) m[fr.index] = fr
++        }
++        if (!m.containsKey(f.index)) m[f.index] = f
++        seq = m
++        startIdx = f.index
++        val chain = ArrayList<Frame>()
++        val seen = HashSet<Int>()
++        var i = startIdx
++        while (true) {
++            val fr = seq[i] ?: break
++            if (!seen.add(i)) break
++            chain.add(fr)
++            val n = fr.top["next"] ?: break
++            if (n >= 999 || (n == 0 && startIdx != 0)) break
++            i = n
++        }
++        playAx = chain.maxOf { it.top["centerx"] ?: 0 }
++        playAy = chain.maxOf { it.top["centery"] ?: 0 }
++        var mw = 0
++        var mh = 0
++        for (fr in chain) {
++            val pic = fr.top["pic"] ?: continue
++            val c = Sprites.cellFor(sheets, pic) ?: continue
++            mw = maxOf(mw, playAx - (fr.top["centerx"] ?: 0) + c.s.w)
++            mh = maxOf(mh, playAy - (fr.top["centery"] ?: 0) + c.s.h)
++            if (!sprites.has(c.s.file)) sprites.request(c.s.file) { canvas.invalidate() }
++        }
++        canvas.boxW = maxOf(120, mw + 10)
++        canvas.boxH = maxOf(110, mh + 10)
++        canvas.sel = null
++        canvas.ghost = null
++        buildForm()
++        canvas.requestLayout()
++        playing = true
++        btnPlay?.text = "Stop"
++        curIdx = startIdx
++        playTick()
++    }
++
++    private fun stopPlay() {
++        if (!playing) return
++        playing = false
++        handler.removeCallbacks(playRun)
++        btnPlay?.text = "Putar"
++        canvas.offX = 0
++        canvas.offY = 0
++        canvas.boxW = null
++        canvas.boxH = null
++        load()
++    }
++
++    private fun playTick() {
++        if (!playing) return
++        if (!root.isShown) { stopPlay(); return }
++        val fr = seq[curIdx] ?: seq[startIdx]
++        if (fr == null) { stopPlay(); return }
++        val pic = fr.top["pic"]
++        val c = if (pic != null) Sprites.cellFor(sheets, pic) else null
++        canvas.frame = fr
++        canvas.cell = c
++        canvas.bmp = if (c != null) sprites.peek(c.s.file) else null
++        canvas.offX = playAx - (fr.top["centerx"] ?: 0)
++        canvas.offY = playAy - (fr.top["centery"] ?: 0)
++        idx.setText(fr.index.toString())
++        cap.setText(fr.caption)
++        msg.text = "▶ ${fr.index} ${fr.caption} · wait ${fr.top["wait"] ?: 0} · ${speedText()}"
++        canvas.invalidate()
++        val wait = (fr.top["wait"] ?: 0).coerceIn(0, 999)
++        var ms = ((wait + 1) * 1000f / 30f / speeds[speedI]).toLong().coerceAtLeast(16L)
++        val n = fr.top["next"]
++        if (n == null || n >= 999 || !seq.containsKey(n) || (n == 0 && startIdx != 0)) {
++            curIdx = startIdx
++            ms += 300L // jeda singkat sebelum mengulang
++        } else {
++            curIdx = n
++        }
++        handler.postDelayed(playRun, ms)
++    }
++
++    // ---------- navigasi & operasi frame ----------
++    private fun navFrame(dir: Int) {
++        if (playing) stopPlay()
++        val t = ed.text.toString()
++        val cur = if (rs >= 0) rs else t.lastIndexOf("<frame>", maxOf(0, ed.selectionStart))
++        val target = if (dir < 0) {
++            if (cur > 0) t.lastIndexOf("<frame>", cur - 1) else -1
++        } else {
++            t.indexOf("<frame>", if (cur >= 0) cur + 7 else maxOf(0, ed.selectionStart))
++        }
++        if (target < 0) { toast(if (dir < 0) "Ini frame pertama" else "Ini frame terakhir"); return }
++        gotoOffset(target + 8)
++    }
++
++    private fun copyFrame() {
++        if (playing) stopPlay()
++        val f = frame
++        if (f == null || rs < 0) { toast("Letakkan kursor di dalam sebuah frame"); return }
++        val t = ed.text.toString()
++        val used = FrameOps.ranges(t).map { it.idx }.toSet()
++        val ni = FrameOps.freeFrom(used, f.index + 1)
++        if (ni == null) { toast("Tidak ada nomor frame yang kosong"); return }
++        val copy = FrameOps.withIndex(t.substring(rs, re), ni)
++        val at = re
++        ed.text.insert(at, "\n\n" + copy)
++        gotoOffset(at + 2 + 8)
++        toast("Frame $ni dibuat dari ${f.index}")
++    }
++
++    private fun delFrame() {
++        if (playing) stopPlay()
++        val f = frame
++        if (f == null || rs < 0) { toast("Letakkan kursor di dalam sebuah frame"); return }
++        val s0 = rs
++        val e0 = re
++        val refs = FrameOps.referrers(ed.text.toString(), f.index, s0)
++        val m = "Hapus frame ${f.index} (${f.caption})?" +
++            if (refs > 0) "\n$refs frame lain masih menuju frame ini lewat next." else ""
++        AlertDialog.Builder(ctx)
++            .setMessage(m)
++            .setPositiveButton("Hapus") { _, _ ->
++                val t = ed.text.toString()
++                if (s0 >= 0 && e0 <= t.length && t.startsWith("<frame>", s0)) {
++                    ed.text.delete(s0, FrameOps.deleteEnd(t, e0))
++                    ed.setSelection(minOf(s0, ed.text.length))
++                }
++            }
++            .setNegativeButton("Batal", null)
++            .show()
++    }
++
++    private fun copyMove() {
++        if (playing) stopPlay()
++        val f = frame
++        if (f == null || rs < 0) { toast("Letakkan kursor di dalam sebuah frame"); return }
++        if (f.index == 0) { toast("Mulai dari frame selain 0"); return }
++        val raws = FrameOps.chain(ed.text.toString(), f.index)
++        if (raws.isEmpty()) return
++        MoveClip.frames = raws
++        try {
++            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++            cm.setPrimaryClip(ClipData.newPlainText("lf2 move", raws.joinToString("\n\n")))
++        } catch (ex: Exception) { }
++        val ids = raws.map { FrameOps.indexOf(it) ?: -1 }
++        toast("Move disalin: ${raws.size} frame (${ids.first()}…${ids.last()})")
++    }
++
++    private fun pasteMove() {
++        if (playing) stopPlay()
++        var src = MoveClip.frames
++        if (src.isEmpty()) {
++            try {
++                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
++                val txt = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(ctx)?.toString() ?: ""
++                src = Tokenizer.getFrames(txt)
++            } catch (ex: Exception) { }
++        }
++        if (src.isEmpty()) { toast("Belum ada move yang disalin"); return }
++        val t = ed.text.toString()
++        val used = FrameOps.ranges(t).map { it.idx }.toSet()
++        val cur = if (rs >= 0) frame?.index else null
++        val base = (cur ?: (used.maxOrNull() ?: 0)) + 1
++        val out = FrameOps.relocate(src, used, base)
++        if (out == null) { toast("Tidak cukup nomor frame yang kosong"); return }
++        val at = if (rs >= 0) re else t.length
++        ed.text.insert(at, "\n\n" + out.joinToString("\n\n"))
++        gotoOffset(at + 2 + 8)
++        toast("Move ditempel: ${out.size} frame")
++    }
++
++    private fun search() {
++        if (playing) stopPlay()
++        val all = FrameOps.headers(ed.text.toString())
++        if (all.isEmpty()) { toast("Tidak ada frame"); return }
++        val box = LinearLayout(ctx).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(dp(ctx, 16), dp(ctx, 8), dp(ctx, 16), 0)
++        }
++        val input = EditText(ctx).apply { hint = "nomor atau nama frame"; setSingleLine() }
++        val list = ListView(ctx)
++        val rows = ArrayList<String>()
++        val adapter = ArrayAdapter(ctx, android.R.layout.simple_list_item_1, rows)
++        list.adapter = adapter
++        var shown: List<FrameHead> = all
++        fun refill() {
++            val q = input.text.toString().trim().lowercase()
++            shown = if (q.isEmpty()) all else all.filter { it.idx.toString().startsWith(q) || it.caption.lowercase().contains(q) }
++            rows.clear()
++            rows.addAll(shown.take(300).map { "${it.idx}   ${it.caption}" })
++            adapter.notifyDataSetChanged()
++        }
++        input.doAfterTextChanged { refill() }
++        box.addView(input)
++        box.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(ctx, 280)))
++        val dlg = AlertDialog.Builder(ctx).setTitle("Cari frame").setView(box).setNegativeButton("Tutup", null).create()
++        list.setOnItemClickListener { _, _, pos, _ ->
++            shown.getOrNull(pos)?.let { gotoOffset(it.pos + 8) }
++            dlg.dismiss()
++        }
++        refill()
++        dlg.show()
++    }
++
+     private fun smallButton(t: String, click: () -> Unit) = Button(ctx).apply {
+         text = t; isAllCaps = false; textSize = 12f
+         setPadding(dp(ctx, 4), 0, dp(ctx, 4), 0)
+@@ -422,10 +713,13 @@ class DesignPanel(
+         col.addView(head)
+ 
+         val visRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+-        for ((k, l) in listOf("bdy" to "bdy", "itr" to "itr", "wpoint" to "w", "opoint" to "o", "cpoint" to "c", "bpoint" to "b", "center" to "center")) {
++        for ((k, l) in listOf("bdy" to "bdy", "itr" to "itr", "wpoint" to "w", "opoint" to "o", "cpoint" to "c", "bpoint" to "b", "center" to "center", "prev" to "prev", "mirror" to "mirror")) {
+             visRow.addView(CheckBox(ctx).apply {
+-                text = l; isChecked = true; setTextColor(C_FG); textSize = 12f
+-                setOnCheckedChangeListener { _, on -> canvas.vis[k] = on; canvas.invalidate() }
++                text = l; isChecked = (k != "prev" && k != "mirror"); setTextColor(C_FG); textSize = 12f
++                setOnCheckedChangeListener { _, on ->
++                    canvas.vis[k] = on
++                    if (k == "prev") refresh() else canvas.invalidate()
++                }
+             })
+         }
+         col.addView(HorizontalScrollView(ctx).apply { addView(visRow); isHorizontalScrollBarEnabled = false })
+@@ -443,6 +737,25 @@ class DesignPanel(
+         btns.addView(smallButton("↻") { load() }, lp())
+         col.addView(btns)
+ 
++        val navRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
++        navRow.addView(smallButton("◀") { navFrame(-1) }, lp())
++        val bp = smallButton("Putar") { togglePlay() }
++        btnPlay = bp
++        navRow.addView(bp, lp())
++        navRow.addView(smallButton("▶") { navFrame(1) }, lp())
++        val bs = smallButton(speedText()) { speedI = (speedI + 1) % speeds.size; btnSpeed?.text = speedText() }
++        btnSpeed = bs
++        navRow.addView(bs, lp())
++        navRow.addView(smallButton("Cari") { search() }, lp())
++        col.addView(navRow)
++
++        val opRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
++        opRow.addView(smallButton("Salin frame") { copyFrame() }, lp())
++        opRow.addView(smallButton("Hapus frame") { delFrame() }, lp())
++        opRow.addView(smallButton("Salin move") { copyMove() }, lp())
++        opRow.addView(smallButton("Tempel move") { pasteMove() }, lp())
++        col.addView(opRow)
++
+         formBox.orientation = LinearLayout.VERTICAL
+         formBox.setPadding(0, dp(ctx, 8), 0, 0)
+         col.addView(formBox)
+@@ -450,6 +763,12 @@ class DesignPanel(
+         canvas.onSelect = { buildForm() }
+         canvas.onMoved = { fields["x"]?.setText(canvas.frame?.obj(canvas.sel)?.v?.get("x")?.toString() ?: ""); fields["y"]?.setText(canvas.frame?.obj(canvas.sel)?.v?.get("y")?.toString() ?: "") }
+         canvas.onDone = { apply() }
++        canvas.onTouchStart = { if (playing) { stopPlay(); true } else false }
+         note()
+     }
+ }
++
++/** Penampung move yang disalin (frame mentah), bisa ditempel ke file lain. */
++object MoveClip {
++    var frames: List<String> = emptyList()
++}
+diff --git a/app/src/main/java/com/lf2ide/mobile/core/FrameOps.kt b/app/src/main/java/com/lf2ide/mobile/core/FrameOps.kt
+new file mode 100644
+index 0000000..b4d7704
+--- /dev/null
++++ b/app/src/main/java/com/lf2ide/mobile/core/FrameOps.kt
+@@ -0,0 +1,137 @@
++package com.lf2ide.mobile.core
++
++/** Satu frame di teks .dat: nomor, posisi awal `<frame>`, dan posisi tepat setelah `<frame_end>`. */
++class FrameRange(val idx: Int, val s: Int, val e: Int)
++
++/** Kepala frame untuk daftar/pencarian: nomor, caption, dan posisi `<frame>`. */
++class FrameHead(val idx: Int, val caption: String, val pos: Int)
++
++/**
++ * Operasi teks pada frame (salin frame, salin/tempel move, hapus, cari).
++ * Bekerja langsung pada teks mentah supaya field yang tidak dikenal parser tidak hilang.
++ */
++object FrameOps {
++    const val MAX_INDEX = 998
++
++    private val HDR = Regex("""<frame>\s+(\d+)""")
++    private val HDR_NAME = Regex("""<frame>\s+(\d+)\s+(\S+)""")
++    private val HDR_SUB = Regex("""^<frame>(\s+)\d+""")
++    private val NEXT = Regex("""(?<![A-Za-z_])next:\s*(\d+)""")
++
++    // field yang berisi nomor frame (tujuan lompatan)
++    private val REF1 = Regex(
++        """(?<![A-Za-z_])(next|hit_a|hit_d|hit_j|hit_Fa|hit_Ua|hit_Da|hit_Fj|hit_Uj|hit_Dj|hit_ja|action|fronthurtact|backhurtact|vaction|aaction|jaction|daction|taction|weaponact):(\s*)(\d+)"""
++    )
++    // itr: dua nomor frame per field
++    private val REF2 = Regex("""(?<![A-Za-z_])(catchingact|caughtact):(\s*)(\d+)(\s+)(\d+)""")
++
++    fun ranges(t: String): List<FrameRange> {
++        val out = ArrayList<FrameRange>()
++        for (m in HDR.findAll(t)) {
++            val idx = m.groupValues[1].toIntOrNull() ?: continue
++            val e = t.indexOf("<frame_end>", m.range.first)
++            if (e < 0) continue
++            out.add(FrameRange(idx, m.range.first, e + 11))
++        }
++        return out
++    }
++
++    fun headers(t: String): List<FrameHead> =
++        HDR_NAME.findAll(t).mapNotNull { m ->
++            val idx = m.groupValues[1].toIntOrNull() ?: return@mapNotNull null
++            FrameHead(idx, m.groupValues[2], m.range.first)
++        }.toList()
++
++    fun indexOf(raw: String): Int? = HDR.find(raw)?.groupValues?.get(1)?.toIntOrNull()
++
++    fun nextOf(raw: String): Int? = NEXT.find(raw)?.groupValues?.get(1)?.toIntOrNull()
++
++    /** Nomor kosong pertama >= from (minimal 1) sampai MAX_INDEX, atau null jika habis. */
++    fun freeFrom(used: Set<Int>, from: Int): Int? {
++        var i = maxOf(1, from)
++        while (i <= MAX_INDEX) {
++            if (i !in used) return i
++            i++
++        }
++        return null
++    }
++
++    fun withIndex(raw: String, ni: Int): String =
++        HDR_SUB.replace(raw) { m -> "<frame>" + m.groupValues[1] + ni }
++
++    private fun mp(s: String, m: Map<Int, Int>): String {
++        val n = s.toIntOrNull() ?: return s
++        val r = if (n != 0) m[n] else null
++        return r?.toString() ?: s
++    }
++
++    /** Ganti tujuan lompatan yang menunjuk ke frame dalam peta (nomor 0 = "tidak ada", tidak diubah). */
++    fun remap(raw: String, m: Map<Int, Int>): String {
++        var r = REF2.replace(raw) { g ->
++            g.groupValues[1] + ":" + g.groupValues[2] + mp(g.groupValues[3], m) + g.groupValues[4] + mp(g.groupValues[5], m)
++        }
++        r = REF1.replace(r) { g -> g.groupValues[1] + ":" + g.groupValues[2] + mp(g.groupValues[3], m) }
++        return r
++    }
++
++    /** Frame-frame sebuah move: mulai dari `start`, ikuti `next` sampai 0, >=999, hilang, atau berulang. */
++    fun chain(t: String, start: Int, limit: Int = 64): List<String> {
++        val byIdx = HashMap<Int, FrameRange>()
++        for (r in ranges(t)) if (!byIdx.containsKey(r.idx)) byIdx[r.idx] = r
++        val out = ArrayList<String>()
++        val seen = HashSet<Int>()
++        var i = start
++        while (out.size < limit) {
++            val r = byIdx[i] ?: break
++            if (!seen.add(i)) break
++            val raw = t.substring(r.s, r.e)
++            out.add(raw)
++            val n = nextOf(raw) ?: break
++            if (n == 0 || n >= 999) break
++            i = n
++        }
++        return out
++    }
++
++    /**
++     * Beri nomor baru (mulai dari `from`, hanya nomor yang belum dipakai) untuk sekelompok frame hasil salinan,
++     * lalu arahkan ulang lompatan antar frame di dalam kelompok itu. Null jika nomor kosong tidak cukup.
++     */
++    fun relocate(raws: List<String>, used: Set<Int>, from: Int): List<String>? {
++        val taken = HashSet(used)
++        val map = LinkedHashMap<Int, Int>()
++        val olds = ArrayList<Int>()
++        var next = from
++        for (raw in raws) {
++            val o = indexOf(raw) ?: return null
++            val ni = freeFrom(taken, next) ?: return null
++            olds.add(o)
++            taken.add(ni)
++            map[o] = ni
++            next = ni + 1
++        }
++        return raws.mapIndexed { k, raw -> remap(withIndex(raw, map.getValue(olds[k])), map) }
++    }
++
++    /** Berapa frame lain (selain yang mulai di `exceptPos`) yang `next`-nya menuju `idx`. */
++    fun referrers(t: String, idx: Int, exceptPos: Int): Int {
++        var n = 0
++        for (r in ranges(t)) {
++            if (r.s == exceptPos) continue
++            val v = nextOf(t.substring(r.s, r.e))
++            if (v == idx) n++
++        }
++        return n
++    }
++
++    /** Hapus frame [s, e) beserta sampai dua pemisah baris setelahnya; kembalikan batas akhir yang dihapus. */
++    fun deleteEnd(t: String, e: Int): Int {
++        var j = e
++        var nl = 0
++        while (j < t.length && nl < 2 && (t[j] == '\n' || t[j] == '\r' || t[j] == ' ' || t[j] == '\t')) {
++            if (t[j] == '\n') nl++
++            j++
++        }
++        return j
++    }
++}
+diff --git a/app/src/test/java/com/lf2ide/mobile/FrameOpsTest.kt b/app/src/test/java/com/lf2ide/mobile/FrameOpsTest.kt
+new file mode 100644
+index 0000000..dda6a13
+--- /dev/null
++++ b/app/src/test/java/com/lf2ide/mobile/FrameOpsTest.kt
+@@ -0,0 +1,111 @@
++package com.lf2ide.mobile
++
++import com.lf2ide.mobile.core.FrameOps
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class FrameOpsTest {
++    private fun fr(i: Int, cap: String, next: Int, extra: String = "") =
++        "<frame> $i $cap\n   pic: $i  state: 3  wait: 2  next: $next  centerx: 40  centery: 79\n$extra<frame_end>"
++
++    private val doc = listOf(
++        fr(0, "standing", 0),
++        fr(60, "punch_1", 61, "   itr:\n      kind: 0  x: 1  y: 2  w: 3  h: 4  catchingact: 62 63\n   itr_end:\n"),
++        fr(61, "punch_2", 62, "   opoint:\n      kind: 1  x: 5  y: 6  action: 60  oid: 200\n   opoint_end:\n"),
++        fr(62, "punch_3", 999, "   hit_a: 60  hit_d: 0\n"),
++        fr(70, "other", 999)
++    ).joinToString("\n\n")
++
++    @Test
++    fun rangesAndHeaders() {
++        val r = FrameOps.ranges(doc)
++        assertEquals(listOf(0, 60, 61, 62, 70), r.map { it.idx })
++        assertTrue(doc.substring(r[1].s, r[1].e).startsWith("<frame> 60 punch_1"))
++        assertTrue(doc.substring(r[1].s, r[1].e).endsWith("<frame_end>"))
++        assertEquals("punch_2", FrameOps.headers(doc)[2].caption)
++    }
++
++    @Test
++    fun freeIndex() {
++        assertEquals(1, FrameOps.freeFrom(setOf(0, 60), 0))
++        assertEquals(63, FrameOps.freeFrom(setOf(61, 62), 61))
++        assertNull(FrameOps.freeFrom(setOf(998), 998))
++    }
++
++    @Test
++    fun chainFollowsNextAndStops() {
++        val c = FrameOps.chain(doc, 60)
++        assertEquals(listOf(60, 61, 62), c.map { FrameOps.indexOf(it) })
++        // berakhir di next >= 999; start dari frame yang tidak ada -> kosong
++        assertEquals(0, FrameOps.chain(doc, 5).size)
++        // next: 0 menghentikan rantai (frame 0 tidak ikut)
++        val loop = fr(10, "a", 11) + "\n\n" + fr(11, "b", 0)
++        assertEquals(2, FrameOps.chain(loop, 10).size)
++    }
++
++    @Test
++    fun relocateRenumbersAndRelinks() {
++        val chain = FrameOps.chain(doc, 60)
++        val used = FrameOps.ranges(doc).map { it.idx }.toSet()
++        val out = FrameOps.relocate(chain, used, 63)!!
++        assertEquals(listOf(63, 64, 65), out.map { FrameOps.indexOf(it) })
++        // next antar frame di dalam kelompok diarahkan ulang; 999 tetap
++        assertEquals(64, FrameOps.nextOf(out[0]))
++        assertEquals(65, FrameOps.nextOf(out[1]))
++        assertEquals(999, FrameOps.nextOf(out[2]))
++        // opoint action 60 -> 63, hit_a 60 -> 63, hit_d 0 tetap 0
++        assertTrue(out[1].contains("action: 63"))
++        assertTrue(out[2].contains("hit_a: 63"))
++        assertTrue(out[2].contains("hit_d: 0"))
++        // catchingact 62 63 (62 -> 65; 63 bukan bagian peta lama, tetap 63)
++        assertTrue(out[0].contains("catchingact: 65 63"))
++        // oid bukan nomor frame, tidak berubah
++        assertTrue(out[1].contains("oid: 200"))
++    }
++
++    @Test
++    fun relocateSkipsUsedAndFailsWhenFull() {
++        val a = fr(1, "a", 2)
++        val b = fr(2, "b", 999)
++        val out = FrameOps.relocate(listOf(a, b), setOf(1, 2, 3, 5), 1)!!
++        assertEquals(listOf(4, 6), out.map { FrameOps.indexOf(it) })
++        assertEquals(6, FrameOps.nextOf(out[0]))
++        val full = (1..FrameOps.MAX_INDEX).toSet()
++        assertNull(FrameOps.relocate(listOf(a), full, 1))
++    }
++
++    @Test
++    fun remapDoesNotTouchSimilarKeys() {
++        val raw = "<frame> 1 x\n   next: 2  weaponact: 2  aaction: 2  fronthurtact: 2  oid: 2  dvx: 2\n<frame_end>"
++        val out = FrameOps.remap(raw, mapOf(2 to 9))
++        assertTrue(out.contains("next: 9"))
++        assertTrue(out.contains("weaponact: 9"))
++        assertTrue(out.contains("aaction: 9"))
++        assertTrue(out.contains("fronthurtact: 9"))
++        assertTrue(out.contains("oid: 2"))
++        assertTrue(out.contains("dvx: 2"))
++    }
++
++    @Test
++    fun copyFrameHeaderOnly() {
++        val raw = fr(61, "punch_2", 62, "   unknown_field: 7\n")
++        val c = FrameOps.withIndex(raw, 80)
++        assertTrue(c.startsWith("<frame> 80 punch_2"))
++        assertTrue(c.contains("unknown_field: 7")) // field tak dikenal tetap ada
++        assertEquals(61, FrameOps.indexOf(raw))
++    }
++
++    @Test
++    fun referrersAndDelete() {
++        assertEquals(1, FrameOps.referrers(doc, 62, FrameOps.ranges(doc)[3].s)) // 61 -> 62
++        assertEquals(0, FrameOps.referrers(doc, 70, -1))
++        val r = FrameOps.ranges(doc)[1]
++        val end = FrameOps.deleteEnd(doc, r.e)
++        val after = doc.substring(0, r.s) + doc.substring(end)
++        assertNotNull(FrameOps.ranges(after).firstOrNull { it.idx == 61 })
++        assertEquals(listOf(0, 61, 62, 70), FrameOps.ranges(after).map { it.idx })
++    }
++}

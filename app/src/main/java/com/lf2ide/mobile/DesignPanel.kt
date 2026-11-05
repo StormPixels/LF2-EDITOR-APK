@@ -1,5 +1,7 @@
 package com.lf2ide.mobile
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapShader
@@ -15,21 +17,29 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
+import androidx.core.widget.doAfterTextChanged
 import com.lf2ide.mobile.core.Cell
 import com.lf2ide.mobile.core.Frame
+import com.lf2ide.mobile.core.FrameHead
+import com.lf2ide.mobile.core.FrameOps
 import com.lf2ide.mobile.core.FrameParser
 import com.lf2ide.mobile.core.FrameWriter
 import com.lf2ide.mobile.core.Schema
 import com.lf2ide.mobile.core.Sect
 import com.lf2ide.mobile.core.Sheet
 import com.lf2ide.mobile.core.Sprites
+import com.lf2ide.mobile.core.Tokenizer
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
@@ -67,9 +77,23 @@ class DesignCanvas(ctx: Context) : View(ctx) {
     var onSelect: (() -> Unit)? = null
     var onMoved: (() -> Unit)? = null
     var onDone: (() -> Unit)? = null
+    var onTouchStart: (() -> Boolean)? = null // true = sentuhan dipakai (mis. menghentikan putaran), jangan pilih apa pun
 
-    private val ww: Int get() = maxOf(120, (cell?.s?.w ?: 0) + 10)
-    private val wh: Int get() = maxOf(110, (cell?.s?.h ?: 0) + 10)
+    // pratinjau animasi: kotak tetap + geser sprite agar titik center sejajar
+    var boxW: Int? = null
+    var boxH: Int? = null
+    var offX = 0
+    var offY = 0
+
+    // onion skin (frame sebelumnya)
+    var ghost: Bitmap? = null
+    var ghostCell: Cell? = null
+    var ghostDx = 0
+    var ghostDy = 0
+    private val ghostPaint = Paint().apply { isFilterBitmap = false; alpha = 90 }
+
+    private val ww: Int get() = boxW ?: maxOf(120, (cell?.s?.w ?: 0) + 10)
+    private val wh: Int get() = boxH ?: maxOf(110, (cell?.s?.h ?: 0) + 10)
     private val bg = Paint()
     private val bp = Paint().apply { isFilterBitmap = false }
     private val fill = Paint().apply { style = Paint.Style.FILL }
@@ -100,6 +124,17 @@ class DesignCanvas(ctx: Context) : View(ctx) {
         val s = width / ww.toFloat()
         c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bg)
         val f = frame ?: return
+        c.save()
+        if (vis["mirror"] == true) c.scale(-1f, 1f, width / 2f, 0f)
+        c.translate(offX * s, offY * s)
+        val gb = ghost
+        val gc = ghostCell
+        if (vis["prev"] == true && gb != null && gc != null) {
+            c.drawBitmap(
+                gb, Rect(gc.sx, gc.sy, gc.sx + gc.s.w, gc.sy + gc.s.h),
+                RectF(ghostDx * s, ghostDy * s, (ghostDx + gc.s.w) * s, (ghostDy + gc.s.h) * s), ghostPaint
+            )
+        }
         val b = bmp
         val ce = cell
         if (b != null && ce != null) {
@@ -109,8 +144,8 @@ class DesignCanvas(ctx: Context) : View(ctx) {
             val cx = f.top["centerx"]
             val cy = f.top["centery"]
             if (cx != null && cy != null) {
-                c.drawLine(cx * s, 0f, cx * s, height.toFloat(), line)
-                c.drawLine(0f, cy * s, width.toFloat(), cy * s, line)
+                c.drawLine(cx * s, -offY * s, cx * s, height - offY * s, line)
+                c.drawLine(-offX * s, cy * s, width - offX * s, cy * s, line)
             }
         }
         for (t in listOf("bdy", "itr")) {
@@ -138,6 +173,7 @@ class DesignCanvas(ctx: Context) : View(ctx) {
             fill.color = COL[t]!!
             c.drawCircle(x * s, y * s, if (sel?.type == t) 7f * s / 2f else 4f * s / 2f, fill)
         }
+        c.restore()
     }
 
     private fun hit(f: Frame, x: Float, y: Float): Sel? {
@@ -166,11 +202,13 @@ class DesignCanvas(ctx: Context) : View(ctx) {
     override fun onTouchEvent(e: MotionEvent): Boolean {
         val f = frame ?: return false
         val s = width / ww.toFloat()
-        val x = e.x / s
-        val y = e.y / s
+        val vx = if (vis["mirror"] == true) width - e.x else e.x
+        val x = vx / s - offX
+        val y = e.y / s - offY
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 parent?.requestDisallowInterceptTouchEvent(true)
+                if (onTouchStart?.invoke() == true) return true
                 sel = hit(f, x, y)
                 onSelect?.invoke()
                 val o = f.obj(sel)
@@ -225,13 +263,27 @@ class DesignPanel(
     private var applying = false
     var folderSet = false
 
+    // pratinjau animasi
+    private var playing = false
+    private val speeds = floatArrayOf(0.25f, 0.5f, 1f, 2f)
+    private var speedI = 2
+    private var seq: Map<Int, Frame> = emptyMap()
+    private var startIdx = 0
+    private var curIdx = 0
+    private var playAx = 0
+    private var playAy = 0
+    private val playRun = Runnable { playTick() }
+    private var btnPlay: Button? = null
+    private var btnSpeed: Button? = null
+
     fun follow() {
         if (applying || !root.isShown) return
+        if (playing) { stopPlay(); return }
         handler.removeCallbacks(run)
         handler.postDelayed(run, 120)
     }
 
-    fun refresh() { if (root.isShown) load() }
+    fun refresh() { if (root.isShown && !playing) load() }
 
     private fun load() {
         val t = ed.text.toString()
@@ -258,6 +310,7 @@ class DesignPanel(
         canvas.frame = fr
         canvas.cell = c
         canvas.bmp = if (c != null) sprites.peek(c.s.file) else null
+        loadGhost(t, fr)
         if (fr?.obj(canvas.sel) == null) canvas.sel = null
         idx.setText(fr?.index?.toString() ?: "")
         cap.setText(fr?.caption ?: "")
@@ -377,12 +430,250 @@ class DesignPanel(
 
     private fun gotoFrame(n: Int) {
         val m = Regex("<frame>\\s+$n\\s").find(ed.text) ?: return
-        val off = m.range.first + 8
+        gotoOffset(m.range.first + 8)
+    }
+
+    private fun gotoOffset(off0: Int) {
+        val off = off0.coerceIn(0, ed.text.length)
         ed.setSelection(off)
         ed.post {
             val lay = ed.layout
             if (lay != null) ed.scrollTo(0, maxOf(0, lay.getLineTop(lay.getLineForOffset(off)) - 2 * ed.lineHeight))
         }
+    }
+
+    private fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_SHORT).show()
+
+    // ---------- onion skin ----------
+    private fun loadGhost(t: String, fr: Frame?) {
+        canvas.ghost = null
+        canvas.ghostCell = null
+        if (canvas.vis["prev"] != true || fr == null || rs <= 0) return
+        val ps = t.lastIndexOf("<frame>", rs - 1)
+        if (ps < 0) return
+        val pe = t.indexOf("<frame_end>", ps)
+        if (pe < 0 || pe >= rs) return
+        val pf = try { FrameParser.read(t.substring(ps, pe + 11)) } catch (ex: Exception) { null } ?: return
+        val pp = pf.top["pic"] ?: return
+        val pc = Sprites.cellFor(sheets, pp) ?: return
+        if (!sprites.has(pc.s.file)) sprites.request(pc.s.file) { refresh() }
+        canvas.ghost = sprites.peek(pc.s.file)
+        canvas.ghostCell = pc
+        canvas.ghostDx = (fr.top["centerx"] ?: 0) - (pf.top["centerx"] ?: 0)
+        canvas.ghostDy = (fr.top["centery"] ?: 0) - (pf.top["centery"] ?: 0)
+    }
+
+    // ---------- pratinjau animasi ----------
+    private fun speedText() = "${speeds[speedI]}×".replace(".0×", "×")
+
+    private fun togglePlay() { if (playing) stopPlay() else startPlay() }
+
+    private fun startPlay() {
+        val f = frame
+        if (f == null) { toast("Letakkan kursor di dalam sebuah frame"); return }
+        val m = LinkedHashMap<Int, Frame>()
+        for (raw in Tokenizer.getFrames(ed.text.toString())) {
+            val fr = try { FrameParser.read(raw) } catch (ex: Exception) { null } ?: continue
+            if (!m.containsKey(fr.index)) m[fr.index] = fr
+        }
+        if (!m.containsKey(f.index)) m[f.index] = f
+        seq = m
+        startIdx = f.index
+        val chain = ArrayList<Frame>()
+        val seen = HashSet<Int>()
+        var i = startIdx
+        while (true) {
+            val fr = seq[i] ?: break
+            if (!seen.add(i)) break
+            chain.add(fr)
+            val n = fr.top["next"] ?: break
+            if (n >= 999 || (n == 0 && startIdx != 0)) break
+            i = n
+        }
+        playAx = chain.maxOf { it.top["centerx"] ?: 0 }
+        playAy = chain.maxOf { it.top["centery"] ?: 0 }
+        var mw = 0
+        var mh = 0
+        for (fr in chain) {
+            val pic = fr.top["pic"] ?: continue
+            val c = Sprites.cellFor(sheets, pic) ?: continue
+            mw = maxOf(mw, playAx - (fr.top["centerx"] ?: 0) + c.s.w)
+            mh = maxOf(mh, playAy - (fr.top["centery"] ?: 0) + c.s.h)
+            if (!sprites.has(c.s.file)) sprites.request(c.s.file) { canvas.invalidate() }
+        }
+        canvas.boxW = maxOf(120, mw + 10)
+        canvas.boxH = maxOf(110, mh + 10)
+        canvas.sel = null
+        canvas.ghost = null
+        buildForm()
+        canvas.requestLayout()
+        playing = true
+        btnPlay?.text = "Stop"
+        curIdx = startIdx
+        playTick()
+    }
+
+    private fun stopPlay() {
+        if (!playing) return
+        playing = false
+        handler.removeCallbacks(playRun)
+        btnPlay?.text = "Putar"
+        canvas.offX = 0
+        canvas.offY = 0
+        canvas.boxW = null
+        canvas.boxH = null
+        load()
+    }
+
+    private fun playTick() {
+        if (!playing) return
+        if (!root.isShown) { stopPlay(); return }
+        val fr = seq[curIdx] ?: seq[startIdx]
+        if (fr == null) { stopPlay(); return }
+        val pic = fr.top["pic"]
+        val c = if (pic != null) Sprites.cellFor(sheets, pic) else null
+        canvas.frame = fr
+        canvas.cell = c
+        canvas.bmp = if (c != null) sprites.peek(c.s.file) else null
+        canvas.offX = playAx - (fr.top["centerx"] ?: 0)
+        canvas.offY = playAy - (fr.top["centery"] ?: 0)
+        idx.setText(fr.index.toString())
+        cap.setText(fr.caption)
+        msg.text = "▶ ${fr.index} ${fr.caption} · wait ${fr.top["wait"] ?: 0} · ${speedText()}"
+        canvas.invalidate()
+        val wait = (fr.top["wait"] ?: 0).coerceIn(0, 999)
+        var ms = ((wait + 1) * 1000f / 30f / speeds[speedI]).toLong().coerceAtLeast(16L)
+        val n = fr.top["next"]
+        if (n == null || n >= 999 || !seq.containsKey(n) || (n == 0 && startIdx != 0)) {
+            curIdx = startIdx
+            ms += 300L // jeda singkat sebelum mengulang
+        } else {
+            curIdx = n
+        }
+        handler.postDelayed(playRun, ms)
+    }
+
+    // ---------- navigasi & operasi frame ----------
+    private fun navFrame(dir: Int) {
+        if (playing) stopPlay()
+        val t = ed.text.toString()
+        val cur = if (rs >= 0) rs else t.lastIndexOf("<frame>", maxOf(0, ed.selectionStart))
+        val target = if (dir < 0) {
+            if (cur > 0) t.lastIndexOf("<frame>", cur - 1) else -1
+        } else {
+            t.indexOf("<frame>", if (cur >= 0) cur + 7 else maxOf(0, ed.selectionStart))
+        }
+        if (target < 0) { toast(if (dir < 0) "Ini frame pertama" else "Ini frame terakhir"); return }
+        gotoOffset(target + 8)
+    }
+
+    private fun copyFrame() {
+        if (playing) stopPlay()
+        val f = frame
+        if (f == null || rs < 0) { toast("Letakkan kursor di dalam sebuah frame"); return }
+        val t = ed.text.toString()
+        val used = FrameOps.ranges(t).map { it.idx }.toSet()
+        val ni = FrameOps.freeFrom(used, f.index + 1)
+        if (ni == null) { toast("Tidak ada nomor frame yang kosong"); return }
+        val copy = FrameOps.withIndex(t.substring(rs, re), ni)
+        val at = re
+        ed.text.insert(at, "\n\n" + copy)
+        gotoOffset(at + 2 + 8)
+        toast("Frame $ni dibuat dari ${f.index}")
+    }
+
+    private fun delFrame() {
+        if (playing) stopPlay()
+        val f = frame
+        if (f == null || rs < 0) { toast("Letakkan kursor di dalam sebuah frame"); return }
+        val s0 = rs
+        val e0 = re
+        val refs = FrameOps.referrers(ed.text.toString(), f.index, s0)
+        val m = "Hapus frame ${f.index} (${f.caption})?" +
+            if (refs > 0) "\n$refs frame lain masih menuju frame ini lewat next." else ""
+        AlertDialog.Builder(ctx)
+            .setMessage(m)
+            .setPositiveButton("Hapus") { _, _ ->
+                val t = ed.text.toString()
+                if (s0 >= 0 && e0 <= t.length && t.startsWith("<frame>", s0)) {
+                    ed.text.delete(s0, FrameOps.deleteEnd(t, e0))
+                    ed.setSelection(minOf(s0, ed.text.length))
+                }
+            }
+            .setNegativeButton("Batal", null)
+            .show()
+    }
+
+    private fun copyMove() {
+        if (playing) stopPlay()
+        val f = frame
+        if (f == null || rs < 0) { toast("Letakkan kursor di dalam sebuah frame"); return }
+        if (f.index == 0) { toast("Mulai dari frame selain 0"); return }
+        val raws = FrameOps.chain(ed.text.toString(), f.index)
+        if (raws.isEmpty()) return
+        MoveClip.frames = raws
+        try {
+            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("lf2 move", raws.joinToString("\n\n")))
+        } catch (ex: Exception) { }
+        val ids = raws.map { FrameOps.indexOf(it) ?: -1 }
+        toast("Move disalin: ${raws.size} frame (${ids.first()}…${ids.last()})")
+    }
+
+    private fun pasteMove() {
+        if (playing) stopPlay()
+        var src = MoveClip.frames
+        if (src.isEmpty()) {
+            try {
+                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val txt = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(ctx)?.toString() ?: ""
+                src = Tokenizer.getFrames(txt)
+            } catch (ex: Exception) { }
+        }
+        if (src.isEmpty()) { toast("Belum ada move yang disalin"); return }
+        val t = ed.text.toString()
+        val used = FrameOps.ranges(t).map { it.idx }.toSet()
+        val cur = if (rs >= 0) frame?.index else null
+        val base = (cur ?: (used.maxOrNull() ?: 0)) + 1
+        val out = FrameOps.relocate(src, used, base)
+        if (out == null) { toast("Tidak cukup nomor frame yang kosong"); return }
+        val at = if (rs >= 0) re else t.length
+        ed.text.insert(at, "\n\n" + out.joinToString("\n\n"))
+        gotoOffset(at + 2 + 8)
+        toast("Move ditempel: ${out.size} frame")
+    }
+
+    private fun search() {
+        if (playing) stopPlay()
+        val all = FrameOps.headers(ed.text.toString())
+        if (all.isEmpty()) { toast("Tidak ada frame"); return }
+        val box = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(ctx, 16), dp(ctx, 8), dp(ctx, 16), 0)
+        }
+        val input = EditText(ctx).apply { hint = "nomor atau nama frame"; setSingleLine() }
+        val list = ListView(ctx)
+        val rows = ArrayList<String>()
+        val adapter = ArrayAdapter(ctx, android.R.layout.simple_list_item_1, rows)
+        list.adapter = adapter
+        var shown: List<FrameHead> = all
+        fun refill() {
+            val q = input.text.toString().trim().lowercase()
+            shown = if (q.isEmpty()) all else all.filter { it.idx.toString().startsWith(q) || it.caption.lowercase().contains(q) }
+            rows.clear()
+            rows.addAll(shown.take(300).map { "${it.idx}   ${it.caption}" })
+            adapter.notifyDataSetChanged()
+        }
+        input.doAfterTextChanged { refill() }
+        box.addView(input)
+        box.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(ctx, 280)))
+        val dlg = AlertDialog.Builder(ctx).setTitle("Cari frame").setView(box).setNegativeButton("Tutup", null).create()
+        list.setOnItemClickListener { _, _, pos, _ ->
+            shown.getOrNull(pos)?.let { gotoOffset(it.pos + 8) }
+            dlg.dismiss()
+        }
+        refill()
+        dlg.show()
     }
 
     private fun smallButton(t: String, click: () -> Unit) = Button(ctx).apply {
@@ -422,10 +713,13 @@ class DesignPanel(
         col.addView(head)
 
         val visRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-        for ((k, l) in listOf("bdy" to "bdy", "itr" to "itr", "wpoint" to "w", "opoint" to "o", "cpoint" to "c", "bpoint" to "b", "center" to "center")) {
+        for ((k, l) in listOf("bdy" to "bdy", "itr" to "itr", "wpoint" to "w", "opoint" to "o", "cpoint" to "c", "bpoint" to "b", "center" to "center", "prev" to "prev", "mirror" to "mirror")) {
             visRow.addView(CheckBox(ctx).apply {
-                text = l; isChecked = true; setTextColor(C_FG); textSize = 12f
-                setOnCheckedChangeListener { _, on -> canvas.vis[k] = on; canvas.invalidate() }
+                text = l; isChecked = (k != "prev" && k != "mirror"); setTextColor(C_FG); textSize = 12f
+                setOnCheckedChangeListener { _, on ->
+                    canvas.vis[k] = on
+                    if (k == "prev") refresh() else canvas.invalidate()
+                }
             })
         }
         col.addView(HorizontalScrollView(ctx).apply { addView(visRow); isHorizontalScrollBarEnabled = false })
@@ -443,6 +737,25 @@ class DesignPanel(
         btns.addView(smallButton("↻") { load() }, lp())
         col.addView(btns)
 
+        val navRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+        navRow.addView(smallButton("◀") { navFrame(-1) }, lp())
+        val bp = smallButton("Putar") { togglePlay() }
+        btnPlay = bp
+        navRow.addView(bp, lp())
+        navRow.addView(smallButton("▶") { navFrame(1) }, lp())
+        val bs = smallButton(speedText()) { speedI = (speedI + 1) % speeds.size; btnSpeed?.text = speedText() }
+        btnSpeed = bs
+        navRow.addView(bs, lp())
+        navRow.addView(smallButton("Cari") { search() }, lp())
+        col.addView(navRow)
+
+        val opRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+        opRow.addView(smallButton("Salin frame") { copyFrame() }, lp())
+        opRow.addView(smallButton("Hapus frame") { delFrame() }, lp())
+        opRow.addView(smallButton("Salin move") { copyMove() }, lp())
+        opRow.addView(smallButton("Tempel move") { pasteMove() }, lp())
+        col.addView(opRow)
+
         formBox.orientation = LinearLayout.VERTICAL
         formBox.setPadding(0, dp(ctx, 8), 0, 0)
         col.addView(formBox)
@@ -450,6 +763,12 @@ class DesignPanel(
         canvas.onSelect = { buildForm() }
         canvas.onMoved = { fields["x"]?.setText(canvas.frame?.obj(canvas.sel)?.v?.get("x")?.toString() ?: ""); fields["y"]?.setText(canvas.frame?.obj(canvas.sel)?.v?.get("y")?.toString() ?: "") }
         canvas.onDone = { apply() }
+        canvas.onTouchStart = { if (playing) { stopPlay(); true } else false }
         note()
     }
+}
+
+/** Penampung move yang disalin (frame mentah), bisa ditempel ke file lain. */
+object MoveClip {
+    var frames: List<String> = emptyList()
 }
