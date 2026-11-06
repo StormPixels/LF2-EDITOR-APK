@@ -67,7 +67,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val pickSprites = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        for (u in uris) sprites.addFromUri(u) { design.refresh(); visual.refresh() }
+        for (u in uris) sprites.addFromUri(u) { design.refresh(); refreshViews() }
     }
 
     private lateinit var content: LinearLayout
@@ -84,6 +84,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var visual: VisualEditor
     private lateinit var browser: ProjectBrowser
     private lateinit var versions: VersionStore
+    private lateinit var stageEd: StageEditor
+    private lateinit var bgEd: BgEditor
+    private var docKind = "object"
+    private var winHidden = false
     private var project: List<DataEntry> = emptyList()
     @Volatile private var scanGen = 0
     private lateinit var keysScroll: HorizontalScrollView
@@ -145,7 +149,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(appBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         editor = CodeEditText(this@MainActivity).apply {
-            onSel = { if (ready) { updateStatus(); design.follow(); visual.follow() } }
+            onSel = { if (ready) { updateStatus(); design.follow(); followViews() } }
             setBackgroundColor(BG)
             setTextColor(FG)
             typeface = Typeface.MONOSPACE
@@ -162,7 +166,7 @@ class MainActivity : AppCompatActivity() {
                 override fun afterTextChanged(s: Editable?) {
                     if (loading) return
                     dirty = true
-                    if (ready) { design.follow(); visual.follow() }
+                    if (ready) { design.follow(); followViews() }
                     scheduleHl(true)
                     handler.removeCallbacks(infoRun)
                     handler.postDelayed(infoRun, 900)
@@ -174,6 +178,8 @@ class MainActivity : AppCompatActivity() {
         versions = VersionStore(java.io.File(filesDir, "history"))
         visual = VisualEditor(this, sprites, editor, { pickSprites.launch(arrayOf("image/*")) }, { treeLauncher.launch(null) }, versions)
         browser = ProjectBrowser(this) { e -> openEntry(e) }
+        stageEd = StageEditor(this, editor) { id -> project.firstOrNull { it.section == "object" && it.id == id }?.name }
+        bgEd = BgEditor(this, sprites, editor)
         win = DesignWindow(this, design.root)
         win.onChanged = { layoutWindow() }
         win.onSettled = { saveWindowPrefs() }
@@ -195,6 +201,10 @@ class MainActivity : AppCompatActivity() {
         stage.addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         visual.root.visibility = View.GONE
         stage.addView(visual.root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        stageEd.root.visibility = View.GONE
+        stage.addView(stageEd.root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        bgEd.root.visibility = View.GONE
+        stage.addView(bgEd.root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         applyOrientation()
         root.addView(stage, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         if (pr.getBoolean("win_float", false)) stage.post { setFloating(true, false) }
@@ -220,15 +230,43 @@ class MainActivity : AppCompatActivity() {
     // ---------- mode Visual / Kode ----------
     private fun setVisual(on: Boolean) {
         visualMode = on
-        if (on) { winVis = win.visibility; win.visibility = View.GONE } else { win.visibility = winVis }
-        content.visibility = if (on) View.GONE else View.VISIBLE
-        visual.root.visibility = if (on) View.VISIBLE else View.GONE
-        keysScroll.visibility = if (on) View.GONE else View.VISIBLE
-        status.visibility = if (on) View.GONE else View.VISIBLE
-        undoBtn.visibility = if (on) View.VISIBLE else View.GONE
-        redoBtn.visibility = if (on) View.VISIBLE else View.GONE
         getSharedPreferences("lf2", MODE_PRIVATE).edit().putBoolean("visual", on).apply()
-        if (on) visual.refresh() else design.refresh()
+        applyMode()
+    }
+
+    private fun detectKind(text: String): String = when {
+        text.contains("<stage>") || text.contains("<phase>") -> "stage"
+        text.contains("layer:") && text.contains("layer_end") -> "bg"
+        text.contains("<frame>") || text.contains("<bmp_begin>") -> "object"
+        else -> "text"
+    }
+
+    private fun refreshViews() { visual.refresh(); stageEd.refresh(); bgEd.refresh() }
+
+    private fun followViews() { visual.follow(); stageEd.follow(); bgEd.follow() }
+
+    /** Pilih tampilan: editor visual (objek), stage, background, atau kode (untuk mode Kode dan file teks lain). */
+    private fun applyMode() {
+        val useVisual = visualMode && docKind == "object"
+        val useStage = visualMode && docKind == "stage"
+        val useBg = visualMode && docKind == "bg"
+        val useCode = !(useVisual || useStage || useBg)
+        if (useCode) {
+            if (winHidden) { win.visibility = winVis; winHidden = false }
+        } else if (!winHidden) {
+            winVis = win.visibility
+            win.visibility = View.GONE
+            winHidden = true
+        }
+        content.visibility = if (useCode) View.VISIBLE else View.GONE
+        visual.root.visibility = if (useVisual) View.VISIBLE else View.GONE
+        stageEd.root.visibility = if (useStage) View.VISIBLE else View.GONE
+        bgEd.root.visibility = if (useBg) View.VISIBLE else View.GONE
+        keysScroll.visibility = if (useCode) View.VISIBLE else View.GONE
+        status.visibility = if (useCode) View.VISIBLE else View.GONE
+        undoBtn.visibility = if (useCode) View.GONE else View.VISIBLE
+        redoBtn.visibility = if (useCode) View.GONE else View.VISIBLE
+        if (useCode) design.refresh() else refreshViews()
     }
 
     // ---------- folder game & pencarian sprite ----------
@@ -243,7 +281,7 @@ class MainActivity : AppCompatActivity() {
         }
         design.folderSet = rootDoc != null
         visual.folderSet = rootDoc != null
-        design.refresh(); visual.refresh()
+        design.refresh(); refreshViews()
         scanProject(fresh)
     }
 
@@ -303,7 +341,7 @@ class MainActivity : AppCompatActivity() {
             applyOrientation()
         }
         if (save) saveWindowPrefs()
-        win.post { design.refresh(); visual.refresh() }
+        win.post { design.refresh(); refreshViews() }
     }
 
     private fun layoutWindow() {
@@ -318,7 +356,7 @@ class MainActivity : AppCompatActivity() {
             applyOrientation()
         }
         saveWindowPrefs()
-        win.post { design.refresh(); visual.refresh() }
+        win.post { design.refresh(); refreshViews() }
     }
 
     private fun saveWindowPrefs() {
@@ -339,6 +377,8 @@ class MainActivity : AppCompatActivity() {
     private fun applyOrientation() {
         val land = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         visual.setLandscape(land)
+        stageEd.setLandscape(land)
+        bgEd.setLandscape(land)
         content.orientation = if (land) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
         val lp = { if (land) LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f) else LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f) }
         editor.layoutParams = lp()
@@ -432,7 +472,7 @@ class MainActivity : AppCompatActivity() {
                 "Reset ukuran & posisi Design" -> resetWindow()
                 else -> {
                     win.visibility = if (win.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-                    design.refresh(); visual.refresh()
+                    design.refresh(); refreshViews()
                 }
             }
             true
@@ -601,6 +641,8 @@ class MainActivity : AppCompatActivity() {
         loading = false
         docUri = uri; docName = name; encrypted = enc; dirty = false; info = ""
         visual.onDocLoaded(if (uri != null) name + "|" + uri.toString() else null, text)
+        docKind = detectKind(text)
+        applyMode()
         hl = Highlighter(langFor(name, text))
         hlA = -1; hlB = -1
         editor.scrollTo(0, 0)

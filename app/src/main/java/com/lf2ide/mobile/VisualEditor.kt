@@ -51,16 +51,16 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-private const val V_BG = 0xFF0B1220.toInt()
-private const val V_PANEL = 0xFF111B2E.toInt()
-private const val V_LINE = 0xFF22324D.toInt()
-private const val V_FG = 0xFFE2E8F0.toInt()
-private const val V_DIM = 0xFF94A3B8.toInt()
-private const val V_ACC = 0xFF22D3EE.toInt()
-private const val V_SEL = 0xFF14365A.toInt()
-private const val V_SEC = 0xFFD4A72C.toInt()
-private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
-private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+internal const val V_BG = 0xFF0B1220.toInt()
+internal const val V_PANEL = 0xFF111B2E.toInt()
+internal const val V_LINE = 0xFF22324D.toInt()
+internal const val V_FG = 0xFFE2E8F0.toInt()
+internal const val V_DIM = 0xFF94A3B8.toInt()
+internal const val V_ACC = 0xFF22D3EE.toInt()
+internal const val V_SEL = 0xFF14365A.toInt()
+internal const val V_SEC = 0xFFD4A72C.toInt()
+internal const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+internal const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 private val V_POINTS = listOf("wpoint", "opoint", "cpoint", "bpoint")
 
 /** Satu baris pada daftar frame kiri: judul grup (info == null) atau satu frame. */
