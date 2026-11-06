@@ -146,6 +146,10 @@ class MainActivity : AppCompatActivity() {
         redoBtn.visibility = View.GONE
         appBar.addView(undoBtn, 2)
         appBar.addView(redoBtn, 3)
+        // tombol rotasi: ketuk = bergantian landscape/portrait, tahan = kembali otomatis
+        val rotateBtn = keyBtn("↻") { rotateScreen() }
+        rotateBtn.setOnLongClickListener { setOrientationMode(0, true); true }
+        appBar.addView(rotateBtn, 2)
         root.addView(appBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         editor = CodeEditText(this@MainActivity).apply {
@@ -224,10 +228,27 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
         ready = true
         updateStatus()
+        setOrientationMode(pr.getInt("orient", 0), false)
         if (pr.getBoolean("visual", true)) setVisual(true)
     }
 
     // ---------- mode Visual / Kode ----------
+    /** mode: 0 otomatis (ikut sensor), 1 landscape, 2 portrait; disimpan agar dipakai lagi saat app dibuka. */
+    private fun setOrientationMode(mode: Int, announce: Boolean) {
+        requestedOrientation = when (mode) {
+            1 -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            2 -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            else -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+        getSharedPreferences("lf2", MODE_PRIVATE).edit().putInt("orient", mode).apply()
+        if (announce) toast(when (mode) { 1 -> "Landscape"; 2 -> "Portrait"; else -> "Rotasi otomatis" })
+    }
+
+    private fun rotateScreen() {
+        val land = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        setOrientationMode(if (land) 2 else 1, true)
+    }
+
     private fun setVisual(on: Boolean) {
         visualMode = on
         getSharedPreferences("lf2", MODE_PRIVATE).edit().putBoolean("visual", on).apply()

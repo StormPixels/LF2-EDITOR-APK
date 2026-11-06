@@ -197,9 +197,11 @@ class StageEditor(
         bar.addView(ui.btn("+ Phase") { addPhase() }, ui.lp(0, WRAP, 1.2f))
         bar.addView(ui.btn("Salin") { copyPhase() }, ui.lp(0, WRAP, 1f))
         bar.addView(ui.btn("Hapus") { deletePhase() }, ui.lp(0, WRAP, 1f))
-        bar.addView(ui.btn("▲") { movePhase(-1) }, ui.lp(0, WRAP, 0.7f))
-        bar.addView(ui.btn("▼") { movePhase(1) }, ui.lp(0, WRAP, 0.7f))
         listPanel.addView(bar, ui.lp(MATCH, WRAP))
+        val bar2 = LinearLayout(ctx)
+        bar2.addView(ui.btn("▲ Naik") { movePhase(-1) }, ui.lp(0, WRAP, 1f))
+        bar2.addView(ui.btn("▼ Turun") { movePhase(1) }, ui.lp(0, WRAP, 1f))
+        listPanel.addView(bar2, ui.lp(MATCH, WRAP))
         phaseList.adapter = adapter
         phaseList.divider = null
         phaseList.setOnItemClickListener { _, _, pos, _ -> ph = pos; en = -1; load() }

@@ -76,11 +76,16 @@ class UiKit(val ctx: Context) {
         }
 
     /** Satu kolom berlabel: nama di atas, isian di bawah. */
-    fun field(label: String, value: String, kind: Int, onFocus: () -> Unit, onCommit: (String) -> Unit): LinearLayout {
+    fun field(
+        label: String, value: String, kind: Int, onFocus: () -> Unit, onCommit: (String) -> Unit, key: String = ""
+    ): LinearLayout {
         val col = LinearLayout(ctx)
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(0, dp(4), dp(6), dp(2))
-        col.addView(tv(label, 12f, V_DIM))
+        val top = LinearLayout(ctx)
+        top.addView(tv(label, 13f, V_FG), lp(0, -2, 1f))
+        if (key.isNotEmpty()) top.addView(tv(key, 10f, V_DIM), lp(-2, -2))
+        col.addView(top)
         col.addView(input(value, kind, onFocus, onCommit), lp(-1, -2))
         return col
     }
